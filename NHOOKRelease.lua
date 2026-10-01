@@ -1,0 +1,5654 @@
+--============================================================
+ -- N-HOOK v5
+ -- WindUI | Dynamic / Hardened Build
+ --============================================================
+local function __NHookMain()
+--============================================================
+ -- WINDUI LOADER
+ --============================================================
+ local WindUI
+local __NHOOK_BOOT_OK = false
+local __NHOOK_BOOT_ERRORS = {}
+
+local function __nHookWarn(stage, err)
+    local msg = string.format("[N-Hook v5] %s: %s", tostring(stage), tostring(err))
+    table.insert(__NHOOK_BOOT_ERRORS, msg)
+    warn(msg)
+end
+
+print("[N-Hook v5] Boot starting...")
+
+-- Delta/mobile-friendly WindUI bootstrap.
+-- Prefer executor request() so GitHub redirects are handled by the executor's
+-- HTTP layer, then fall back to game:HttpGet when request is unavailable.
+local function __nHookFetch(url)
+    local errors = {}
+
+    local requestFns = {}
+    if type(request) == "function" then
+        requestFns[#requestFns + 1] = request
+    end
+    if type(http_request) == "function" then
+        requestFns[#requestFns + 1] = http_request
+    end
+    if syn and type(syn.request) == "function" then
+        requestFns[#requestFns + 1] = syn.request
+    end
+
+    for _, requestFn in ipairs(requestFns) do
+        local ok, response = pcall(function()
+            return requestFn({
+                Url = url,
+                Method = "GET",
+            })
+        end)
+
+        if ok and type(response) == "table" then
+            local body = response.Body or response.body
+            local status = tonumber(response.StatusCode or response.Status or response.status)
+
+            if type(body) == "string" and #body >= 100 then
+                if status == nil or (status >= 200 and status < 400) then
+                    return body
+                end
+                errors[#errors + 1] = "HTTP " .. tostring(status)
+            else
+                errors[#errors + 1] = "request returned no usable Body"
+            end
+        elseif not ok then
+            errors[#errors + 1] = tostring(response)
+        end
+    end
+
+    if type(game.HttpGet) == "function" then
+        local ok, body = pcall(function()
+            return game:HttpGet(url)
+        end)
+        if ok and type(body) == "string" and #body >= 100 then
+            return body
+        end
+        if not ok then
+            errors[#errors + 1] = "game:HttpGet: " .. tostring(body)
+        elseif type(body) ~= "string" then
+            errors[#errors + 1] = "game:HttpGet returned " .. typeof(body)
+        else
+            errors[#errors + 1] = "game:HttpGet returned a short response"
+        end
+    else
+        errors[#errors + 1] = "game:HttpGet unavailable"
+    end
+
+    return nil, table.concat(errors, " | ")
+end
+
+do
+    local sources = {
+        -- Current latest WindUI release (1.6.66 as of this build).
+        "https://github.com/Footagesus/WindUI/releases/download/1.6.66/main.lua",
+        -- Raw dist fallback; this path exists in the current WindUI repository.
+        "https://raw.githubusercontent.com/Footagesus/WindUI/refs/heads/main/dist/main.lua",
+        -- Last-resort latest release URL for executors that handle this redirect.
+        "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
+    }
+
+    local compile = loadstring
+    if type(compile) ~= "function" then
+        __nHookWarn("BOOT FAILED - loadstring is unavailable", "executor does not expose loadstring")
+    else
+        for _, url in ipairs(sources) do
+            print("[N-Hook v5] Trying WindUI: " .. url)
+
+            local source, fetchError = __nHookFetch(url)
+            if type(source) ~= "string" then
+                __nHookWarn("WindUI download failed", fetchError or "no response body")
+            else
+                -- Reject obvious HTML/redirect pages before compilation.
+                local looksLikeLua = source:find("function", 1, true)
+                    or source:find("CreateWindow", 1, true)
+                    or source:find("local WindUI", 1, true)
+
+                if #source < 100 or not looksLikeLua then
+                    __nHookWarn("WindUI candidate rejected", "response was not recognized as Lua (" .. tostring(#source) .. " bytes)")
+                else
+                    local okCompile, loader, compileError = pcall(compile, source)
+                    if okCompile and type(loader) == "function" then
+                        local okLibrary, library = pcall(loader)
+                        if okLibrary and library ~= nil then
+                            local okCreate, createWindow = pcall(function()
+                                return library.CreateWindow
+                            end)
+
+                            if okCreate and type(createWindow) == "function" then
+                                WindUI = library
+                                __NHOOK_BOOT_OK = true
+                                print("[N-Hook v5] WindUI loaded successfully")
+                                break
+                            end
+
+                            __nHookWarn("WindUI candidate rejected", "CreateWindow is missing")
+                        else
+                            __nHookWarn("WindUI candidate failed to initialize", library)
+                        end
+                    else
+                        __nHookWarn("WindUI candidate failed to compile", compileError)
+                    end
+                end
+            end
+        end
+    end
+
+    if not __NHOOK_BOOT_OK or WindUI == nil then
+        __nHookWarn("BOOT FAILED - WindUI", "all loader sources failed")
+        return
+    end
+end
+
+--============================================================
+ -- SERVICES
+ --============================================================
+ local Players = game:GetService("Players")
+ local UIS = game:GetService("UserInputService")
+ local RS = game:GetService("ReplicatedStorage")
+ local WS = game:GetService("Workspace")
+ local RunService = game:GetService("RunService")
+ local Lighting = game:GetService("Lighting")
+ local CoreGui = game:GetService("CoreGui")
+local GuiService = game:GetService("GuiService")
+local VirtualUser = game:GetService("VirtualUser")
+ local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
+local ContextActionService = game:GetService("ContextActionService")
+local LP = Players.LocalPlayer
+if not LP then
+ warn("[N-Hook v5] LocalPlayer not available")
+ return
+ end
+--============================================================
+ -- STATE
+ --============================================================
+ local S = {
+ --========================================================
+ -- WIN FARM
+ --========================================================
+ winFarm = false,
+ tpPads = true,
+ padDelay = 0.04,
+ padFilter = 0,
+ autoRescan = true,
+ selectedPad = nil,
+ onlySelected = false,
+ sortDesc = true,
+ notifyTouch = false,
+ stopAtWins = 0,
+semiAutoFarm = false,
+savePadCache = true,
+expectedPadCount = 15,
+streamingAssist = true,
+antiStreaming = true,
+antiStreamingRadius = 4096,
+speedBurst = 500,
+speedBurstCancel = false,
+speedBurstRunning = false,
+mobileFlyControls = true,
+hideGroupPopups = true,
+hideP2WButtons = true,
+--========================================================  
+-- SPEED  
+--========================================================  
+speedSpam = false,  
+speedDelay = 0.03,  
+
+--========================================================  
+-- MOVEMENT  
+--========================================================  
+infJump = false,  
+walkSpeed = 32,  
+jumpPower = 50,  
+hipHeight = 2,  
+noclip = false,  
+fly = false,  
+flySpeed = 100,  
+
+--========================================================  
+-- VISUAL / PERFORMANCE  
+--========================================================  
+fullbright = false,  
+removeGameplayPaused = true,  
+hideSpeedPopups = true,  
+mobileOptimize = false,  
+fpsUnlock = false,  
+antiAfk = false,  
+streamAhead = false,  
+removeKillParts = false,  
+
+--========================================================  
+-- AURAS  
+--========================================================  
+auraEquipAll = false,  
+auraBuy = false,  
+auraCycle = false,  
+auraCycleDelay = 1.5,  
+auraIndex = 1,  
+selectedAura = nil,  
+
+--========================================================  
+-- TRAILS  
+--========================================================  
+trailEquipAll = false,  
+trailBuy = false,  
+trailCycle = false,  
+trailCycleDelay = 1.5,  
+trailIndex = 1,  
+selectedTrail = nil,  
+ownedAurasOnly = false,  
+ownedTrailsOnly = false,  
+selectedUpgrade = nil,  
+upgradeFarm = false,  
+upgradeDelay = 0.15,  
+selectedEmote = nil,  
+emoteCycle = false,  
+emoteCycleDelay = 2,  
+
+--========================================================  
+-- AUTOMATION  
+--========================================================  
+autoLevel = false,  
+autoRebirth = false,  
+autoUpgrade = false,  
+autoClaim = false,  
+autoAd = false,  
+autoNotif = false,  
+autoTutorial = false,  
+autoDelay = 0.5,  
+
+--========================================================  
+-- PRIVACY  
+--========================================================  
+anonymous = false,  
+randomAlias = true,  
+customAlias = "",  
+alias = nil,  
+
+--========================================================  
+-- LIFECYCLE  
+--========================================================  
+alive = true,
+semiAutoRunId = 0,
+
+}
+--============================================================
+ -- CONNECTION STORAGE
+ --============================================================
+ local Connections = {}
+local function connect(signal, callback)
+ if not signal then
+ return nil
+ end
+local ok, connection = pcall(function()  
+    return signal:Connect(callback)  
+end)  
+
+if ok and connection then  
+    table.insert(Connections, connection)  
+    return connection  
+end  
+
+return nil
+
+end
+local function disconnectAll()
+ for _, connection in ipairs(Connections) do
+ pcall(function()
+ connection:Disconnect()
+ end)
+ end
+table.clear(Connections)
+
+end
+--============================================================
+ -- HELPERS
+ --============================================================
+ local function fmt(n)
+ n = math.floor(tonumber(n) or 0)
+if n >= 1e12 then  
+    return ("%.2fT"):format(n / 1e12)  
+elseif n >= 1e9 then  
+    return ("%.2fB"):format(n / 1e9)  
+elseif n >= 1e6 then  
+    return ("%.2fM"):format(n / 1e6)  
+elseif n >= 1e3 then  
+    return ("%.2fK"):format(n / 1e3)  
+end  
+
+return tostring(n)
+
+end
+local function getStat(name)
+ local ls = LP:FindFirstChild("leaderstats")
+ local v = ls and ls:FindFirstChild(name)
+if v and v.Value ~= nil then  
+    return v.Value  
+end  
+
+return 0
+
+end
+local function getCharacter()
+ return LP.Character
+ end
+local function getHumanoid()
+ local char = getCharacter()
+return char  
+    and char:FindFirstChildOfClass("Humanoid")
+
+end
+local function getHRP()
+ local char = getCharacter()
+return char  
+    and char:FindFirstChild("HumanoidRootPart")
+
+end
+local function notify(title, content, duration)
+ pcall(function()
+ if WindUI and WindUI.Notify then
+ WindUI:Notify({
+ Title = tostring(title or ""),
+ Content = tostring(content or ""),
+ Duration = tonumber(duration) or 2,
+ })
+ end
+ end)
+ end
+local function safeText(value)
+ if value == nil then
+ return ""
+ end
+return tostring(value)
+
+end
+--============================================================
+ -- CLIPBOARD SUPPORT
+ --============================================================
+ -- Avoid repeated WindUI paragraph rebuilds when the displayed text did not change.
+local ParagraphDescCache = setmetatable({}, {__mode = "k"})
+local function setParagraphDesc(paragraph, value)
+    if not paragraph then return end
+    local desc = tostring(value or "")
+    if ParagraphDescCache[paragraph] == desc then return end
+    ParagraphDescCache[paragraph] = desc
+    pcall(function() paragraph:SetDesc(desc) end)
+end
+local function copyToClipboard(text)
+ text = tostring(text or "")
+local clipboardFunctions = {  
+    "setclipboard",  
+    "toclipboard",  
+    "set_clipboard",  
+    "writeclipboard",  
+}  
+
+for _, functionName in ipairs(clipboardFunctions) do  
+    local fn  
+
+    pcall(function()  
+        if type(getgenv) == "function" then  
+            local env = getgenv()  
+
+            if env then  
+                fn = env[functionName]  
+            end  
+        end  
+    end)  
+
+    if type(fn) ~= "function" then  
+        pcall(function()  
+            if type(_G[functionName]) == "function" then  
+                fn = _G[functionName]  
+            end  
+        end)  
+    end  
+
+    if type(fn) == "function" then  
+        local ok = pcall(function()  
+            fn(text)  
+        end)  
+
+        if ok then  
+            return true  
+        end  
+    end  
+end  
+
+if type(setclipboard) == "function" then  
+    return pcall(setclipboard, text)  
+end  
+
+if type(toclipboard) == "function" then  
+    return pcall(toclipboard, text)  
+end  
+
+if type(set_clipboard) == "function" then  
+    return pcall(set_clipboard, text)  
+end  
+
+if type(writeclipboard) == "function" then  
+    return pcall(writeclipboard, text)  
+end  
+
+return false
+
+end
+local DISCORD_INVITE =
+ "https://discord.gg/"
+ .. "erjuPcY4Tq"
+--============================================================
+ -- GAME REMOTES
+ --============================================================
+ local Events
+local function refreshEventsFolder()
+ Events = RS:FindFirstChild("Events")
+ return Events
+ end
+pcall(refreshEventsFolder)
+local RemoteNames = {
+ "CarAction",
+ "TrailAction",
+ "AddSpeed",
+ "LevelUp",
+ "RequestRebirth",
+ "UpgradeSuccess",
+ "ShowNotification",
+ "ClaimGroupReward",
+ "AdRewardRequest",
+ "UpdateTutorialStep",
+ }
+local RemoteCache = {}
+local function getRemote(name)
+ if not Events or not Events.Parent then
+ refreshEventsFolder()
+ end
+if not Events then  
+    return nil  
+end  
+
+local cached = RemoteCache[name]  
+
+if cached and cached.Parent then  
+    return cached  
+end  
+
+local obj = Events:FindFirstChild(name)  
+
+if obj then  
+    RemoteCache[name] = obj  
+    return obj  
+end  
+
+return nil
+
+end
+local function fireRemote(name, ...)
+ local remote = getRemote(name)
+if not remote  
+    or not remote:IsA("RemoteEvent") then  
+
+    return false  
+end  
+
+local args = table.pack(...)  
+
+local ok = pcall(function()  
+    remote:FireServer(  
+        table.unpack(  
+            args,  
+            1,  
+            args.n  
+        )  
+    )  
+end)  
+
+return ok
+
+end
+local function invokeRemote(name, ...)
+ local remote = getRemote(name)
+if not remote  
+    or not remote:IsA("RemoteFunction") then  
+
+    return false, nil  
+end  
+
+local args = table.pack(...)  
+
+local ok, result = pcall(function()  
+    return remote:InvokeServer(  
+        table.unpack(  
+            args,  
+            1,  
+            args.n  
+        )  
+    )  
+end)  
+
+return ok, result
+
+end
+--============================================================
+ -- REMOTE DIAGNOSTICS
+ --============================================================
+ task.spawn(function()
+ task.wait(2)
+if not S.alive then  
+    return  
+end  
+
+local missing = {}  
+
+for _, name in ipairs(RemoteNames) do  
+    if not getRemote(name) then  
+        table.insert(  
+            missing,  
+            name  
+        )  
+    end  
+end  
+
+if #missing > 0 then  
+    warn(  
+        "[N-Hook v5] Missing game remotes: "  
+            .. table.concat(  
+                missing,  
+                ", "  
+            )  
+    )  
+else  
+    print(  
+        "[N-Hook v5] All expected game remotes found."  
+    )  
+end
+
+end)
+--============================================================
+ -- TOUCH SUPPORT
+ --============================================================
+ local HAS_FTI =
+ type(firetouchinterest) == "function"
+--============================================================
+ -- DYNAMIC NUMBER PARSER
+ --============================================================
+ local function parseNumber(value)
+ if value == nil then
+ return nil
+ end
+local text = tostring(value)  
+
+text = text  
+    :gsub(",", "")  
+    :gsub("%s+", "")  
+
+local number, suffix =  
+    text:match(  
+        "([%d%.]+)([KkMmBbTt]?)"  
+    )  
+
+if not number then  
+    return nil  
+end  
+
+local n = tonumber(number)  
+
+if not n then  
+    return nil  
+end  
+
+suffix = (suffix or ""):upper()  
+
+if suffix == "K" then  
+    n *= 1e3  
+elseif suffix == "M" then  
+    n *= 1e6  
+elseif suffix == "B" then  
+    n *= 1e9  
+elseif suffix == "T" then  
+    n *= 1e12  
+end  
+
+return math.floor(n)
+
+end
+--============================================================
+ -- WIN PAD DISCOVERY
+ --============================================================
+local KnownWinAmounts = {
+    [1] = 1,
+    [2] = 3,
+    [3] = 5,
+    [4] = 10,
+    [5] = 15,
+    [6] = 25,
+    [7] = 35,
+    [8] = 45,
+    [9] = 100,
+    [10] = 200,
+    [11] = 300,
+    [12] = 1000,
+    [13] = 2000,
+    [14] = 3000,
+    [15] = 5000,
+}
+
+local WinPads = {}
+
+-- Runtime farm stats. This table must exist before scanWinPads() runs.
+-- The original build referenced farm.totalPads / farm.touches before
+-- declaring the table, which caused an immediate nil-index crash.
+local farm = {
+    totalPads = 0,
+    touches = 0,
+}
+
+-- Optional per-place CFrame cache. Everything is guarded so missing executor
+-- file APIs never prevent the main script from loading.
+local WinPadCache = {}
+local PAD_CACHE_FILE = "NHookV5_WinPads_" .. tostring(game.PlaceId) .. ".json"
+local function cacheFileApi()
+    return type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
+end
+local function saveWinPadCache()
+    if not S.savePadCache or not cacheFileApi() then return end
+    local out = {}
+    for k,v in pairs(WinPadCache) do
+        if v and typeof(v.cframe) == "CFrame" then
+            local c = {v.cframe:GetComponents()}
+            out[k] = {index=v.index, amount=v.amount, cframe=c}
+        end
+    end
+    pcall(function() writefile(PAD_CACHE_FILE, HttpService:JSONEncode(out)) end)
+end
+local function loadWinPadCache()
+    if not cacheFileApi() then return end
+    local exists=false
+    pcall(function() exists=isfile(PAD_CACHE_FILE) end)
+    if not exists then return end
+    local ok,raw=pcall(readfile,PAD_CACHE_FILE)
+    if not ok or type(raw)~="string" then return end
+    local ok2,data=pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok2 or type(data)~="table" then return end
+    for k,v in pairs(data) do
+        if type(v)=="table" and type(v.cframe)=="table" and #v.cframe>=12 then
+            local ok3,cf=pcall(function() return CFrame.new(table.unpack(v.cframe,1,12)) end)
+            if ok3 and cf then WinPadCache[tostring(k)]={index=tonumber(v.index) or tonumber(k),amount=tonumber(v.amount) or 0,cframe=cf} end
+        end
+    end
+end
+local function cacheLivePad(pad)
+    if not pad then return end
+    local cf = pad.cframe
+    if (not cf) and pad.part and pad.part.Parent then
+        cf = pad.part.CFrame
+    end
+    if typeof(cf) ~= "CFrame" then return end
+    WinPadCache[tostring(pad.index)]={index=pad.index,amount=pad.amount,cframe=cf}
+end
+local function combinedPads()
+    local result={} local seen={}
+    for _,p in ipairs(WinPads) do result[#result+1]=p; seen[p.index]=true end
+    for k,v in pairs(WinPadCache) do
+        local i=tonumber(k)
+        if i and not seen[i] and v.cframe then result[#result+1]={index=i,name=tostring(i),part=nil,obj=nil,amount=v.amount,cframe=v.cframe,cached=true} end
+    end
+    table.sort(result,function(a,b) if a.amount==b.amount then return a.index<b.index end return a.amount<b.amount end)
+    return result
+end
+pcall(loadWinPadCache)
+
+local function getGiveWinsFolder()
+    return WS:FindFirstChild("GiveWins")
+end
+
+local function numericName(name)
+    local n = tonumber(tostring(name or ""))
+    if n and n == math.floor(n) then
+        return n
+    end
+    return nil
+end
+
+local function findTouchPart(root)
+    if not root then return nil end
+
+    if root:IsA("BasePart") and root.Name == "Touch" then
+        return root
+    end
+
+    local direct = root:FindFirstChild("Touch")
+    if direct and direct:IsA("BasePart") then
+        return direct
+    end
+
+    local touch = root:FindFirstChild("Touch", true)
+    if touch and touch:IsA("BasePart") then
+        return touch
+    end
+
+    return nil
+end
+
+local function getPadCFrame(root)
+    if not root then return nil end
+
+    local touch = findTouchPart(root)
+    if touch then
+        return touch.CFrame
+    end
+
+    if root:IsA("BasePart") then
+        return root.CFrame
+    end
+
+    if root:IsA("Model") then
+        if root.PrimaryPart then
+            return root.PrimaryPart.CFrame
+        end
+
+        local ok, pivot = pcall(function()
+            return root:GetPivot()
+        end)
+        if ok and typeof(pivot) == "CFrame" then
+            return pivot
+        end
+
+        local okWorld, worldPivot = pcall(function()
+            return root.WorldPivot
+        end)
+        if okWorld and typeof(worldPivot) == "CFrame" then
+            return worldPivot
+        end
+    end
+
+    local firstPart = root:FindFirstChildWhichIsA("BasePart", true)
+    if firstPart then
+        return firstPart.CFrame
+    end
+
+    return nil
+end
+
+local function getWinAmount(root, index)
+    if not root then return 0 end
+
+    local amount = root:GetAttribute("WinAmount")
+    if type(amount) == "number" and amount > 0 then
+        return math.floor(amount)
+    end
+
+    local touch = findTouchPart(root)
+    if touch then
+        amount = touch:GetAttribute("WinAmount")
+        if type(amount) == "number" and amount > 0 then
+            return math.floor(amount)
+        end
+    end
+
+    local valueNames = {"Amount", "Wins", "Win", "Value", "Reward"}
+    for _, name in ipairs(valueNames) do
+        local obj = root:FindFirstChild(name, true)
+        if obj and obj:IsA("ValueBase") then
+            local n = tonumber(obj.Value)
+            if n and n > 0 then
+                return math.floor(n)
+            end
+        end
+    end
+
+    return KnownWinAmounts[index] or 0
+end
+
+local function collectPadCandidates(folder)
+    local candidates = {}
+    local seenObjects = {}
+
+    -- Important: GetDescendants() excludes the direct children. In this game
+    -- the pads are named 1..15 directly under Workspace.GiveWins, so scan
+    -- direct children first.
+    for _, child in ipairs(folder:GetChildren()) do
+        local index = numericName(child.Name)
+        if index and index > 0 and not seenObjects[child] then
+            seenObjects[child] = true
+            candidates[#candidates + 1] = {root = child, index = index}
+        end
+    end
+
+    -- Also support games that wrap pads in another folder/model.
+    for _, descendant in ipairs(folder:GetDescendants()) do
+        local index = numericName(descendant.Name)
+        if index and index > 0 and not seenObjects[descendant] then
+            seenObjects[descendant] = true
+            candidates[#candidates + 1] = {root = descendant, index = index}
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.index < b.index
+    end)
+    return candidates
+end
+
+local function scanWinPads()
+    table.clear(WinPads)
+
+    local folder = getGiveWinsFolder()
+    if not folder then
+        farm.totalPads = 0
+        return 0
+    end
+
+    -- Prefer one authoritative entry per numeric pad index. If several
+    -- nested numeric objects exist, prefer the one that actually has Touch,
+    -- otherwise keep the first valid CFrame/pivot entry.
+    local byIndex = {}
+
+    for _, candidate in ipairs(collectPadCandidates(folder)) do
+        local root = candidate.root
+        local index = candidate.index
+        local touch = findTouchPart(root)
+        local cframe = getPadCFrame(root)
+        local amount = getWinAmount(root, index)
+
+        if cframe and amount > 0 then
+            local current = byIndex[index]
+            local entry = {
+                index = index,
+                name = tostring(index),
+                part = touch,
+                obj = root,
+                amount = amount,
+                cframe = cframe,
+                position = cframe.Position,
+                cached = (touch == nil),
+            }
+
+            if not current or (not current.part and touch) then
+                byIndex[index] = entry
+            end
+        end
+    end
+
+    for i = 1, S.expectedPadCount do
+        local pad = byIndex[i]
+        if pad then
+            WinPads[#WinPads + 1] = pad
+            cacheLivePad(pad)
+        end
+    end
+
+    -- Include valid numeric pads beyond the expected count too.
+    for index, pad in pairs(byIndex) do
+        if index > S.expectedPadCount then
+            WinPads[#WinPads + 1] = pad
+            cacheLivePad(pad)
+        end
+    end
+
+    table.sort(WinPads, function(a, b)
+        if S.sortDesc then
+            if a.amount == b.amount then return a.index > b.index end
+            return a.amount > b.amount
+        end
+        if a.amount == b.amount then return a.index < b.index end
+        return a.amount < b.amount
+    end)
+
+    farm.totalPads = #WinPads
+    return #WinPads
+end
+
+pcall(scanWinPads)
+pcall(saveWinPadCache)
+
+--============================================================
+ -- PAD DROPDOWN MAPPING
+ --============================================================
+local PadOptionToPad = {}
+local PadNameToOption = {}
+
+local function normalizeDropdownValue(value)
+    if type(value) == "table" then
+        if value.Title ~= nil then
+            return tostring(value.Title)
+        end
+
+        if value[1] ~= nil then
+            if type(value[1]) == "table" and value[1].Title ~= nil then
+                return tostring(value[1].Title)
+            end
+            return tostring(value[1])
+        end
+
+        return nil
+    end
+
+    if value == nil then
+        return nil
+    end
+
+    return tostring(value)
+end
+
+local function padValues()
+    local values = {}
+    table.clear(PadOptionToPad)
+    table.clear(PadNameToOption)
+
+    local pads = combinedPads()
+    for _, pad in ipairs(pads) do
+        local label = ("%02d | Pad %s | +%s Wins%s"):format(
+            pad.index,
+            pad.name,
+            fmt(pad.amount),
+            pad.cached and " | cached" or ""
+        )
+
+        table.insert(values, label)
+        PadOptionToPad[label] = pad
+        PadNameToOption[pad.name] = label
+    end
+
+    if #values == 0 then
+        table.insert(values, "No pads detected")
+    end
+
+    return values
+end
+
+local function findPadFromName(name)
+    if not name then return nil end
+    local wanted = tonumber(name)
+    if wanted then
+        for _, pad in ipairs(WinPads) do
+            if pad.index == wanted then return pad end
+        end
+        local cached = WinPadCache[tostring(wanted)]
+        if cached and typeof(cached.cframe) == "CFrame" then
+            return {
+                index = wanted,
+                name = tostring(wanted),
+                part = nil,
+                obj = nil,
+                amount = tonumber(cached.amount) or 0,
+                cframe = cached.cframe,
+                position = cached.cframe.Position,
+                cached = true,
+            }
+        end
+    end
+    return nil
+end
+
+local function findPadFromLabel(value)
+    local normalized = normalizeDropdownValue(value)
+    if not normalized then
+        return nil
+    end
+
+    return PadOptionToPad[normalized]
+end
+
+local padDD
+local PadWatcherConnections = {}
+local function disconnectPadWatcher()
+    for _, connection in ipairs(PadWatcherConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(PadWatcherConnections)
+end
+
+local function setupPadWatcher()
+    disconnectPadWatcher()
+
+    local folder = getGiveWinsFolder()
+    if not folder then
+        return
+    end
+
+    local dirty = true
+    local lastPadSignature = ""
+        local lastScan = 0
+
+    table.insert(PadWatcherConnections, folder.ChildAdded:Connect(function()
+        dirty = true
+    end))
+    table.insert(PadWatcherConnections, folder.ChildRemoved:Connect(function()
+        dirty = true
+    end))
+
+    task.spawn(function()
+        while S.alive do
+            if S.autoRescan and (dirty or os.clock() - lastScan >= 2) then
+                -- Keep a slow fallback scan for StreamingEnabled without
+                -- repeatedly traversing the whole pad tree every 0.5s.
+                local oldCount = #WinPads
+                pcall(scanWinPads)
+                lastScan = os.clock()
+
+                local signatureParts = {}
+                for _, pad in ipairs(WinPads) do
+                    table.insert(signatureParts, tostring(pad.index) .. ":" .. tostring(pad.amount))
+                end
+                local signature = table.concat(signatureParts, "|")
+
+                if dirty or signature ~= lastPadSignature or #WinPads ~= oldCount then
+                    dirty = false
+                    lastPadSignature = signature
+                    pcall(function()
+                        if padDD and padDD.Refresh then
+                            padDD:Refresh(padValues())
+                            if S.selectedPad and PadNameToOption[S.selectedPad] and padDD.Select then
+                                pcall(function()
+                                    padDD:Select(PadNameToOption[S.selectedPad])
+                                end)
+                            end
+                        end
+                    end)
+                end
+            end
+            task.wait(0.5)
+        end
+    end)
+end
+
+pcall(setupPadWatcher)
+--============================================================
+ -- AURA / TRAIL DISCOVERY
+ --============================================================
+local function addUniqueName(list, seen, value)
+    local name = tostring(value or "")
+    if name ~= "" and not seen[name] then
+        seen[name] = true
+        table.insert(list, name)
+    end
+end
+
+local KnownAuraNames = {
+    "Dark Devil", "The Last King", "Crimson", "Dark Matter Aura",
+    "Toxic Aura", "Devil Aura", "Lightning Aura", "Rich Aura",
+    "Purple Shine Aura", "Sparkle Aura", "Disco Aura", "Flame Aura",
+}
+
+local KnownTrailNames = {
+    "GoldenTrail", "NovaTrail", "MoonTrail", "BlackTrail", "WhiteTrail",
+    "RainbowTrail", "PurpleTrail", "BlueTrail", "OrangeTrail",
+}
+
+local AuraNames = {}
+local AuraSeen = {}
+for _, name in ipairs(KnownAuraNames) do
+    addUniqueName(AuraNames, AuraSeen, name)
+end
+
+local models = RS:FindFirstChild("Models")
+if models then
+    for _, child in ipairs(models:GetChildren()) do
+        addUniqueName(AuraNames, AuraSeen, child.Name)
+    end
+end
+
+local playerCars = LP:FindFirstChild("Cars")
+if playerCars then
+    for _, child in ipairs(playerCars:GetChildren()) do
+        addUniqueName(AuraNames, AuraSeen, child.Name)
+    end
+end
+
+table.sort(AuraNames)
+
+local TrailNames = {}
+local TrailSeen = {}
+for _, name in ipairs(KnownTrailNames) do
+    addUniqueName(TrailNames, TrailSeen, name)
+end
+
+for _, rootName in ipairs({"Templates", "Trails", "Particles"}) do
+    local root = RS:FindFirstChild(rootName)
+    if root then
+        for _, child in ipairs(root:GetChildren()) do
+            addUniqueName(TrailNames, TrailSeen, child.Name)
+        end
+    end
+end
+
+local playerTrails = LP:FindFirstChild("Trails")
+if playerTrails then
+    for _, child in ipairs(playerTrails:GetChildren()) do
+        addUniqueName(TrailNames, TrailSeen, child.Name)
+    end
+end
+
+table.sort(TrailNames)
+S.selectedAura = AuraNames[1]
+S.selectedTrail = TrailNames[1]
+
+local function getOwnedNameSet(folderName)
+    local result = {}
+    local folder = LP:FindFirstChild(folderName)
+    if not folder then return result end
+
+    for _, child in ipairs(folder:GetChildren()) do
+        result[child.Name] = true
+    end
+    return result
+end
+
+local function getAuraDropdownValues()
+    if not S.ownedAurasOnly then return AuraNames end
+    local owned = getOwnedNameSet("Cars")
+    local result = {}
+    for _, name in ipairs(AuraNames) do
+        if owned[name] then table.insert(result, name) end
+    end
+    return #result > 0 and result or {"No owned auras detected"}
+end
+
+local function getTrailDropdownValues()
+    if not S.ownedTrailsOnly then return TrailNames end
+    local owned = getOwnedNameSet("Trails")
+    local result = {}
+    for _, name in ipairs(TrailNames) do
+        if owned[name] then table.insert(result, name) end
+    end
+    return #result > 0 and result or {"No owned trails detected"}
+end
+-- Cached/live pad route helper. A cached CFrame is a location fallback;
+-- the actual Touch part is still preferred whenever it becomes available.
+local function touchPart(part)
+    local hrp = getHRP()
+    if not part or not part.Parent or not hrp then return false end
+
+    if HAS_FTI then
+        local ok = pcall(function()
+            firetouchinterest(part, hrp, 0)
+            task.wait(0.006)
+            firetouchinterest(part, hrp, 1)
+        end)
+        if ok then return true end
+    end
+
+    return pcall(function()
+        hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 2.5, 0))
+    end)
+end
+
+local function getCachedPad(index)
+    local item = WinPadCache[tostring(index)]
+    if item and typeof(item.cframe) == "CFrame" then
+        return {
+            index = tonumber(index) or item.index,
+            name = tostring(index),
+            part = nil,
+            obj = nil,
+            amount = tonumber(item.amount) or 0,
+            cframe = item.cframe,
+            position = item.cframe.Position,
+            cached = true,
+        }
+    end
+    return nil
+end
+
+local function findAnyPadByIndex(index)
+    index = tonumber(index)
+    if not index then return nil end
+
+    for _, pad in ipairs(WinPads) do
+        if pad.index == index then
+            return pad
+        end
+    end
+
+    return getCachedPad(index)
+end
+
+local function teleportToPad(pad, requestStream, forceTeleport)
+    if not pad then return false, "no pad" end
+
+    local targetCF = pad.cframe
+    if pad.part and pad.part.Parent then
+        targetCF = pad.part.CFrame
+    end
+
+    if typeof(targetCF) ~= "CFrame" then
+        return false, "no position"
+    end
+
+    if requestStream ~= false and S.streamingAssist then
+        pcall(function()
+            LP:RequestStreamAroundAsync(targetCF.Position)
+        end)
+    end
+
+    local character = getCharacter()
+    local hrp = getHRP()
+    if not character or not hrp then
+        return false, "character unavailable"
+    end
+
+    if not forceTeleport and not S.tpPads then
+        return true, "teleport disabled"
+    end
+
+    local destination = targetCF + Vector3.new(0, 3, 0)
+    local ok = pcall(function()
+        character:PivotTo(destination)
+    end)
+
+    if not ok then
+        ok = pcall(function()
+            hrp.CFrame = destination
+        end)
+    end
+
+    if not ok then
+        return false, "teleport failed"
+    end
+
+    return true
+end
+
+local function semiAutoTouch(pad, runId)
+    if not pad then return false end
+    if runId and runId ~= S.semiAutoRunId then return false end
+    if not S.alive or not S.semiAutoFarm then return false end
+
+    -- Request the destination before moving there. Do not touch the same
+    -- pad repeatedly or run a full Workspace scan for every pad.
+    local teleported = teleportToPad(pad, true, false)
+    if not teleported then return false end
+
+    -- Give streaming a short opportunity to materialize a Touch child.
+    if not pad.part then
+        task.wait(0.04)
+        if runId and runId ~= S.semiAutoRunId then return false end
+        pcall(scanWinPads)
+        local live = findAnyPadByIndex(pad.index)
+        if live then
+            pad = live
+        end
+    end
+
+    if pad.part and pad.part.Parent then
+        return touchPart(pad.part)
+    end
+
+    -- A pivot-only pad has no local Touch object. It has still been visited;
+    -- don't falsely report a Touch fired when there is nothing to fire.
+    return true
+end
+
+local function runSemiAutoCycle(runId)
+    local route = combinedPads()
+    if #route == 0 then
+        notify("Semi-Auto Farm", "No pads known yet.", 3)
+        S.semiAutoFarm = false
+        return
+    end
+
+    -- Lowest -> highest is explicit and independent of the normal farm sort.
+    table.sort(route, function(a, b)
+        if a.amount == b.amount then return a.index < b.index end
+        return a.amount < b.amount
+    end)
+
+    for _, pad in ipairs(route) do
+        if runId ~= S.semiAutoRunId or not S.alive or not S.semiAutoFarm then
+            break
+        end
+
+        if pad.amount >= S.padFilter then
+            semiAutoTouch(pad, runId)
+        end
+
+        task.wait(math.max(tonumber(S.padDelay) or 0.04, 0.05))
+    end
+
+    if runId == S.semiAutoRunId then
+        saveWinPadCache()
+        S.semiAutoFarm = false
+    end
+end
+--============================================================
+ -- WIN FARM LOOP
+ --============================================================
+local function streamAhead(position)
+    if not S.streamAhead or not position then return end
+    pcall(function() LP:RequestStreamAroundAsync(position) end)
+end
+
+task.spawn(function()
+    local lastFarmRescan = 0
+    while S.alive do
+        if S.autoRescan and os.clock() - lastFarmRescan >= 2 then
+            pcall(scanWinPads)
+            lastFarmRescan = os.clock()
+        end
+
+        if S.winFarm and not S.semiAutoFarm then
+            local currentList = combinedPads()
+            if S.onlySelected and S.selectedPad then
+                local selected = findAnyPadByIndex(S.selectedPad)
+                currentList = selected and {selected} or {}
+            end
+
+            for _, pad in ipairs(currentList) do
+                if not S.alive or not S.winFarm or S.semiAutoFarm then break end
+                if pad and pad.amount >= S.padFilter then
+                    local targetCF = pad.cframe
+                    if pad.part and pad.part.Parent then targetCF = pad.part.CFrame end
+
+                    if targetCF then
+                        streamAhead(targetCF.Position)
+                        local didTeleport = teleportToPad(pad, S.streamingAssist)
+
+                        if pad.part and pad.part.Parent and didTeleport then
+                            if touchPart(pad.part) then
+                                farm.touches += 1
+                                if S.notifyTouch then
+                                    notify("Pad Touched", ("Pad %s (+%s Wins)"):format(pad.name, fmt(pad.amount)), 0.6)
+                                end
+
+                                if S.stopAtWins > 0 and tonumber(getStat("Wins")) >= S.stopAtWins then
+                                    S.winFarm = false
+                                    notify("Win Farm", "Stopped at " .. fmt(getStat("Wins")) .. " wins", 4)
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+                task.wait(math.max(tonumber(S.padDelay) or 0.04, 0.03))
+            end
+        end
+
+        task.wait(0.05)
+    end
+end)
+
+--============================================================
+ -- UPGRADE WIN BUTTON DISCOVERY
+ --============================================================
+local UpgradeButtons = {}
+local upgradeDD
+local UpgradeOptionToButton = {}
+local SelectedUpgradeToOption = {}
+
+local function getUpgradeFolder()
+    return WS:FindFirstChild("UpgradeWins")
+end
+
+local function readUpgradeNumber(root, attributeName)
+    if not root then
+        return 0
+    end
+
+    local value = root:GetAttribute(attributeName)
+    if type(value) == "number" then
+        return value
+    end
+
+    local touch = findTouchPart(root)
+    if touch then
+        value = touch:GetAttribute(attributeName)
+        if type(value) == "number" then
+            return value
+        end
+    end
+
+    return 0
+end
+
+local function scanUpgradeButtons()
+    table.clear(UpgradeButtons)
+
+    local folder = getUpgradeFolder()
+    if not folder then
+        return 0
+    end
+
+    for _, child in ipairs(folder:GetChildren()) do
+        local index = tostring(child.Name):match("^Button(%d+)$")
+        if index then
+            index = tonumber(index)
+            local touch = findTouchPart(child)
+
+            if touch then
+                table.insert(UpgradeButtons, {
+                    index = index,
+                    name = child.Name,
+                    part = touch,
+                    obj = child,
+                    speedBonus = readUpgradeNumber(child, "SpeedBonus"),
+                    winCost = readUpgradeNumber(child, "WinCost"),
+                })
+            end
+        end
+    end
+
+    table.sort(UpgradeButtons, function(a, b)
+        return a.index < b.index
+    end)
+
+    return #UpgradeButtons
+end
+
+local function upgradeValues()
+    local values = {}
+    table.clear(UpgradeOptionToButton)
+    table.clear(SelectedUpgradeToOption)
+
+    for _, button in ipairs(UpgradeButtons) do
+        local label = ("Button%d | +%s Speed | %s Win Cost"):format(
+            button.index,
+            fmt(button.speedBonus),
+            fmt(button.winCost)
+        )
+
+        table.insert(values, label)
+        UpgradeOptionToButton[label] = button
+        SelectedUpgradeToOption[button.name] = label
+    end
+
+    if #values == 0 then
+        table.insert(values, "No upgrade buttons detected")
+    end
+
+    return values
+end
+
+local function findUpgrade(value)
+    local normalized = normalizeDropdownValue(value)
+    return normalized and UpgradeOptionToButton[normalized] or nil
+end
+
+pcall(scanUpgradeButtons)
+
+local UpgradeWatcherConnections = {}
+local function disconnectUpgradeWatcher()
+    for _, connection in ipairs(UpgradeWatcherConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(UpgradeWatcherConnections)
+end
+
+local function setupUpgradeWatcher()
+    disconnectUpgradeWatcher()
+
+    local folder = getUpgradeFolder()
+    if not folder then
+        return
+    end
+
+    local dirty = true
+
+    table.insert(UpgradeWatcherConnections, folder.ChildAdded:Connect(function()
+        dirty = true
+    end))
+    table.insert(UpgradeWatcherConnections, folder.ChildRemoved:Connect(function()
+        dirty = true
+    end))
+
+    task.spawn(function()
+        while S.alive do
+            if dirty then
+                dirty = false
+                pcall(function()
+                    scanUpgradeButtons()
+                    if upgradeDD and upgradeDD.Refresh then
+                        upgradeDD:Refresh(upgradeValues())
+                        if S.selectedUpgrade
+                            and SelectedUpgradeToOption[S.selectedUpgrade]
+                            and upgradeDD.Select then
+                            pcall(function()
+                                upgradeDD:Select(SelectedUpgradeToOption[S.selectedUpgrade])
+                            end)
+                        end
+                    end
+                end)
+            end
+            task.wait(1)
+        end
+    end)
+end
+
+pcall(setupUpgradeWatcher)
+
+task.spawn(function()
+    while S.alive do
+        if S.upgradeFarm then
+            local hrp = getHRP()
+            if hrp and #UpgradeButtons > 0 then
+                for _, button in ipairs(UpgradeButtons) do
+                    if not S.alive or not S.upgradeFarm then
+                        break
+                    end
+
+                    if button.part and button.part.Parent then
+                        streamAhead(button.part.Position)
+                        pcall(function()
+                            hrp.CFrame = CFrame.new(
+                                button.part.Position + Vector3.new(0, 2.5, 0)
+                            )
+                        end)
+                        touchPart(button.part)
+                        task.wait(math.max(tonumber(S.upgradeDelay) or 0.15, 0.02))
+                    end
+                end
+            end
+        end
+        task.wait(0.05)
+    end
+end)
+--============================================================
+ -- SPEED SPAM
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.speedSpam then
+ fireRemote("AddSpeed")
+task.wait(  
+            math.max(  
+                tonumber(S.speedDelay)  
+                    or 0.03,  
+                0.005  
+            )  
+        )  
+    else  
+        task.wait(0.1)  
+    end  
+end
+
+end)
+--============================================================
+ -- AUTO LEVEL
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.autoLevel then
+ local level =
+ getStat("Level")
+fireRemote(  
+            "LevelUp",  
+            level,  
+            level + 1  
+        )  
+
+        task.wait(  
+            math.max(  
+                tonumber(S.autoDelay)  
+                    or 0.5,  
+                0.01  
+            )  
+        )  
+    else  
+        task.wait(0.1)  
+    end  
+end
+
+end)
+--============================================================
+ -- AUTO REBIRTH
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.autoRebirth then
+ invokeRemote(
+ "RequestRebirth"
+ )
+task.wait(  
+            math.max(  
+                tonumber(S.autoDelay)  
+                    or 0.5,  
+                0.01  
+            )  
+        )  
+    else  
+        task.wait(0.1)  
+    end  
+end
+
+end)
+--============================================================
+ -- AUTO UPGRADE
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.autoUpgrade then
+ fireRemote(
+ "UpgradeSuccess"
+ )
+task.wait(  
+            math.max(  
+                tonumber(S.autoDelay)  
+                    or 0.5,  
+                0.01  
+            )  
+        )  
+    else  
+        task.wait(0.1)  
+    end  
+end
+
+end)
+--============================================================
+ -- AUTO GROUP CLAIM
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.autoClaim then
+ fireRemote(
+ "ClaimGroupReward"
+ )
+task.wait(2)  
+    else  
+        task.wait(0.5)  
+    end  
+end
+
+end)
+--============================================================
+ -- AUTO AD
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.autoAd then
+ fireRemote(
+ "AdRewardRequest"
+ )
+task.wait(  
+            math.max(  
+                tonumber(S.autoDelay)  
+                    or 0.5,  
+                0.01  
+            )  
+        )  
+    else  
+        task.wait(0.1)  
+    end  
+end
+
+end)
+--============================================================
+ -- AUTO NOTIFICATION
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.autoNotif then
+ fireRemote(
+ "ShowNotification",
+ "N-Hook v5",
+ "Loaded",
+ 1
+ )
+task.wait(  
+            math.max(  
+                tonumber(S.autoDelay)  
+                    or 0.5,  
+                0.01  
+            )  
+        )  
+    else  
+        task.wait(0.1)  
+    end  
+end
+
+end)
+--============================================================
+ -- AUTO TUTORIAL
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.autoTutorial then
+ fireRemote(
+ "UpdateTutorialStep",
+ 999
+ )
+task.wait(1)  
+    else  
+        task.wait(0.5)  
+    end  
+end
+
+end)
+--============================================================
+ -- AURA EQUIP ALL
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.auraEquipAll then
+ for _, name in ipairs(
+ AuraNames
+ ) do
+ if not S.alive
+ or not S.auraEquipAll then
+ break
+ end
+fireRemote(  
+                "CarAction",  
+                "Equip",  
+                name  
+            )  
+
+            task.wait(0.05)  
+        end  
+    end  
+
+    task.wait(0.5)  
+end
+
+end)
+--============================================================
+ -- TRAIL EQUIP ALL
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.trailEquipAll then
+ for _, name in ipairs(
+ TrailNames
+ ) do
+ if not S.alive
+ or not S.trailEquipAll then
+ break
+ end
+fireRemote(  
+                "TrailAction",  
+                "Equip",  
+                name  
+            )  
+
+            task.wait(0.05)  
+        end  
+    end  
+
+    task.wait(0.5)  
+end
+
+end)
+--============================================================
+ -- AURA BUY
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.auraBuy then
+ for _, name in ipairs(
+ AuraNames
+ ) do
+ if not S.alive
+ or not S.auraBuy then
+ break
+ end
+fireRemote(  
+                "CarAction",  
+                "Buy",  
+                name  
+            )  
+
+            fireRemote(  
+                "CarAction",  
+                "Purchase",  
+                name  
+            )  
+
+            task.wait(0.1)  
+        end  
+    end  
+
+    task.wait(0.5)  
+end
+
+end)
+--============================================================
+ -- TRAIL BUY
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.trailBuy then
+ for _, name in ipairs(
+ TrailNames
+ ) do
+ if not S.alive
+ or not S.trailBuy then
+ break
+ end
+fireRemote(  
+                "TrailAction",  
+                "Buy",  
+                name  
+            )  
+
+            fireRemote(  
+                "TrailAction",  
+                "Purchase",  
+                name  
+            )  
+
+            task.wait(0.1)  
+        end  
+    end  
+
+    task.wait(0.5)  
+end
+
+end)
+--============================================================
+ -- RANDOM AURA CYCLE
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.auraCycle
+ and #AuraNames > 0 then
+local nextIndex  
+
+        repeat  
+            nextIndex =  
+                math.random(  
+                    1,  
+                    #AuraNames  
+                )  
+        until #AuraNames <= 1  
+            or nextIndex  
+                ~= S.auraIndex  
+
+        S.auraIndex =  
+            nextIndex  
+
+        fireRemote(  
+            "CarAction",  
+            "Equip",  
+            AuraNames[  
+                S.auraIndex  
+            ]  
+        )  
+
+        task.wait(  
+            math.max(  
+                tonumber(  
+                    S.auraCycleDelay  
+                )  
+                    or 1.5,  
+                0.1  
+            )  
+        )  
+    else  
+        task.wait(0.2)  
+    end  
+end
+
+end)
+--============================================================
+ -- RANDOM TRAIL CYCLE
+ --============================================================
+ task.spawn(function()
+ while S.alive do
+ if S.trailCycle
+ and #TrailNames > 0 then
+local nextIndex  
+
+        repeat  
+            nextIndex =  
+                math.random(  
+                    1,  
+                    #TrailNames  
+                )  
+        until #TrailNames <= 1  
+            or nextIndex  
+                ~= S.trailIndex  
+
+        S.trailIndex =  
+            nextIndex  
+
+        fireRemote(  
+            "TrailAction",  
+            "Equip",  
+            TrailNames[  
+                S.trailIndex  
+            ]  
+        )  
+
+        task.wait(  
+            math.max(  
+                tonumber(  
+                    S.trailCycleDelay  
+                )  
+                    or 1.5,  
+                0.1  
+            )  
+        )  
+    else  
+        task.wait(0.2)  
+    end  
+end
+
+end)
+--============================================================
+ -- NOCLIP
+ --============================================================
+local lastNoclipApply = 0
+ connect(
+ RunService.Stepped,
+ function()
+ if not S.noclip then
+ return
+ end
+ if os.clock() - lastNoclipApply < 0.08 then
+ return
+ end
+ lastNoclipApply = os.clock()
+local char =  
+        getCharacter()  
+
+    if not char then  
+        return  
+    end  
+
+    for _, part in ipairs(  
+        char:GetDescendants()  
+    ) do  
+        if part:IsA("BasePart")  
+            and part.CanCollide then  
+
+            part.CanCollide = false  
+        end  
+    end  
+end
+
+)
+--============================================================
+ -- INFINITE JUMP
+ --============================================================
+ connect(
+ UIS.JumpRequest,
+ function()
+ if not S.infJump then
+ return
+ end
+local hum =  
+        getHumanoid()  
+
+    if hum then  
+        pcall(function()  
+            hum:ChangeState(  
+                Enum.HumanoidStateType.Jumping  
+            )  
+        end)  
+    end  
+end
+
+)
+task.spawn(function()
+ while S.alive do
+ if S.infJump
+ and UIS:IsKeyDown(
+ Enum.KeyCode.Space
+ ) then
+local hum =  
+            getHumanoid()  
+
+        if hum then  
+            pcall(function()  
+                hum:ChangeState(  
+                    Enum.HumanoidStateType.Jumping  
+                )  
+            end)  
+        end  
+    end  
+
+    task.wait(0.05)  
+end
+
+end)
+--============================================================
+ -- FLY
+ --============================================================
+ local MobileFlyActions = {}
+local FlyInputState = {Forward=false, Back=false, Left=false, Right=false, Up=false, Down=false}
+
+local function setMobileFlyControls(enabled)
+    for _, name in ipairs(MobileFlyActions) do
+        pcall(function() ContextActionService:UnbindAction(name) end)
+    end
+    table.clear(MobileFlyActions)
+    for key in pairs(FlyInputState) do FlyInputState[key] = false end
+
+    if not enabled or not S.mobileFlyControls then return end
+
+    local defs = {
+        {"NHookFlyForward", Enum.KeyCode.W, "↑", "Forward"},
+        {"NHookFlyBack", Enum.KeyCode.S, "↓", "Back"},
+        {"NHookFlyLeft", Enum.KeyCode.A, "←", "Left"},
+        {"NHookFlyRight", Enum.KeyCode.D, "→", "Right"},
+        {"NHookFlyUp", Enum.KeyCode.Space, "UP", "Up"},
+        {"NHookFlyDown", Enum.KeyCode.LeftControl, "DOWN", "Down"},
+    }
+
+    for _, d in ipairs(defs) do
+        pcall(function()
+            ContextActionService:BindAction(d[1], function(_, state)
+                FlyInputState[d[4]] = state == Enum.UserInputState.Begin or state == Enum.UserInputState.Change
+                if state == Enum.UserInputState.End or state == Enum.UserInputState.Cancel then
+                    FlyInputState[d[4]] = false
+                end
+                return Enum.ContextActionResult.Pass
+            end, true, d[2])
+            ContextActionService:SetTitle(d[1], d[3])
+            table.insert(MobileFlyActions, d[1])
+        end)
+    end
+end
+
+local flyBV
+ local flyBG
+local function stopFly()
+ if flyBV then
+ pcall(function()
+ flyBV:Destroy()
+ end)
+flyBV = nil  
+end  
+
+if flyBG then  
+    pcall(function()  
+        flyBG:Destroy()  
+    end)  
+
+    flyBG = nil  
+end
+
+end
+task.spawn(function()
+ while S.alive do
+ if S.fly then
+ local hrp =
+ getHRP()
+if hrp  
+            and not flyBV then  
+
+            flyBV =  
+                Instance.new(  
+                    "BodyVelocity"  
+                )  
+
+            flyBV.MaxForce =  
+                Vector3.new(  
+                    1e5,  
+                    1e5,  
+                    1e5  
+                )  
+
+            flyBV.Velocity =  
+                Vector3.zero  
+
+            flyBV.Parent =  
+                hrp  
+
+            flyBG =  
+                Instance.new(  
+                    "BodyGyro"  
+                )  
+
+            flyBG.MaxTorque =  
+                Vector3.new(  
+                    1e5,  
+                    1e5,  
+                    1e5  
+                )  
+
+            flyBG.P =  
+                1e4  
+
+            flyBG.Parent =  
+                hrp  
+        end  
+
+        if hrp  
+            and flyBV then  
+
+            local camera =  
+                WS.CurrentCamera  
+
+            if camera then  
+                local direction =  
+                    Vector3.zero  
+
+                if FlyInputState.Forward or UIS:IsKeyDown(Enum.KeyCode.W) then  
+                    direction +=  
+                        camera.CFrame.LookVector  
+                end  
+
+                if FlyInputState.Back or UIS:IsKeyDown(Enum.KeyCode.S) then  
+                    direction -=  
+                        camera.CFrame.LookVector  
+                end  
+
+                if FlyInputState.Left or UIS:IsKeyDown(Enum.KeyCode.A) then  
+                    direction -=  
+                        camera.CFrame.RightVector  
+                end  
+
+                if FlyInputState.Right or UIS:IsKeyDown(Enum.KeyCode.D) then  
+                    direction +=  
+                        camera.CFrame.RightVector  
+                end  
+
+                if FlyInputState.Up or UIS:IsKeyDown(Enum.KeyCode.Space) then  
+                    direction +=  
+                        Vector3.new(  
+                            0,  
+                            1,  
+                            0  
+                        )  
+                end  
+
+                if FlyInputState.Down or UIS:IsKeyDown(Enum.KeyCode.LeftControl) then  
+                    direction -=  
+                        Vector3.new(  
+                            0,  
+                            1,  
+                            0  
+                        )  
+                end  
+
+                flyBV.Velocity =  
+                    direction  
+                    * S.flySpeed  
+
+                if flyBG then  
+                    flyBG.CFrame =  
+                        camera.CFrame  
+                end  
+            end  
+        end  
+    else  
+        if flyBV  
+            or flyBG then  
+
+            stopFly()  
+        end  
+    end  
+
+    task.wait(0.05)  
+end
+
+end)
+--============================================================
+ -- CHARACTER SETTINGS
+ --============================================================
+ local function applyCharacterSettings(
+ character
+ )
+ if not character then
+ return
+ end
+local hum =  
+    character:FindFirstChildOfClass(  
+        "Humanoid"  
+    )  
+
+if not hum then  
+    hum =  
+        character:WaitForChild(  
+            "Humanoid",  
+            5  
+        )  
+end  
+
+if not hum then  
+    return  
+end  
+
+pcall(function()  
+    hum.WalkSpeed =  
+        S.walkSpeed  
+end)  
+
+pcall(function()  
+    hum.UseJumpPower = true  
+    hum.JumpPower =  
+        S.jumpPower  
+end)  
+
+pcall(function()  
+    hum.HipHeight =  
+        S.hipHeight  
+end)
+
+end
+-- Forward declaration because this function is
+ -- referenced by CharacterAdded before its implementation.
+ local setCharacterAnonymous
+connect(
+ LP.CharacterAdded,
+ function(character)
+ task.wait(0.25)
+applyCharacterSettings(  
+        character  
+    )  
+
+    stopFly()  
+
+    if S.anonymous then  
+        task.wait(0.2)  
+
+        if setCharacterAnonymous then  
+            setCharacterAnonymous(  
+                true  
+            )  
+        end  
+    end  
+end
+
+)
+if LP.Character then
+ task.spawn(function()
+ applyCharacterSettings(
+ LP.Character
+ )
+ end)
+ end
+--============================================================
+ -- LIGHTING
+ --============================================================
+ local OriginalLighting = {
+ Ambient = Lighting.Ambient,
+ Brightness = Lighting.Brightness,
+ OutdoorAmbient =
+ Lighting.OutdoorAmbient,
+ FogEnd = Lighting.FogEnd,
+ FogStart =
+ Lighting.FogStart,
+ }
+local function restoreLighting()
+ pcall(function()
+ Lighting.Ambient =
+ OriginalLighting.Ambient
+Lighting.Brightness =  
+        OriginalLighting.Brightness  
+
+    Lighting.OutdoorAmbient =  
+        OriginalLighting.OutdoorAmbient  
+
+    Lighting.FogEnd =  
+        OriginalLighting.FogEnd  
+
+    Lighting.FogStart =  
+        OriginalLighting.FogStart  
+end)
+
+end
+--============================================================
+ -- PRIVACY / ANONYMOUS SYSTEM
+ --============================================================
+ local OriginalDisplayName
+ local OriginalDisplayDistanceType
+local function generateAlias()
+ local adjectives = {
+ "Silent",
+ "Hidden",
+ "Unknown",
+ "Private",
+ "Shadow",
+ "Ghost",
+ "Nova",
+ "Cipher",
+ "Random",
+ "Unknown",
+ }
+local nouns = {  
+    "Player",  
+    "User",  
+    "Runner",  
+    "Guest",  
+    "Entity",  
+    "Walker",  
+    "Client",  
+    "Visitor",  
+    "Member",  
+    "Avatar",  
+}  
+
+local adjective =  
+    adjectives[  
+        math.random(  
+            1,  
+            #adjectives  
+        )  
+    ]  
+
+local noun =  
+    nouns[  
+        math.random(  
+            1,  
+            #nouns  
+        )  
+    ]  
+
+return adjective  
+    .. noun  
+    .. tostring(  
+        math.random(  
+            1000,  
+            9999  
+        )  
+    )
+
+end
+S.alias =
+ generateAlias()
+local function getPrivacyAlias()
+ if S.customAlias
+ and S.customAlias ~= "" then
+return S.customAlias  
+end  
+
+if not S.alias  
+    or S.alias == "" then  
+
+    S.alias =  
+        generateAlias()  
+end  
+
+return S.alias
+
+end
+local function shouldReplaceText(
+ text
+ )
+ if not S.anonymous then
+ return false
+ end
+if not text  
+    or text == "" then  
+
+    return false  
+end  
+
+local originalName =  
+    LP.Name  
+
+local displayName =  
+    LP.DisplayName  
+
+local lowered =  
+    text:lower()  
+
+if originalName  
+    and originalName ~= ""  
+    and lowered:find(  
+        originalName:lower(),  
+        1,  
+        true  
+    ) then  
+
+    return true  
+end  
+
+if displayName  
+    and displayName ~= ""  
+    and lowered:find(  
+        displayName:lower(),  
+        1,  
+        true  
+    ) then  
+
+    return true  
+end  
+
+return false
+
+end
+local function escapePattern(text)
+    return tostring(text or ""):gsub("([%%%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")
+end
+
+local function replacePlayerText(text)
+    if not S.anonymous or not text or text == "" then
+        return text
+    end
+
+    local alias = getPrivacyAlias()
+    local result = tostring(text)
+
+    if LP.Name and LP.Name ~= "" then
+        result = result:gsub(escapePattern(LP.Name), alias)
+    end
+
+    if LP.DisplayName and LP.DisplayName ~= "" then
+        result = result:gsub(escapePattern(LP.DisplayName), alias)
+    end
+
+    return result
+end
+local function anonymizeTextObject(
+ object
+ )
+ if not object
+ or not object.Parent then
+return  
+end  
+
+if not (  
+    object:IsA("TextLabel")  
+    or object:IsA("TextButton")  
+    or object:IsA("TextBox")  
+) then  
+    return  
+end  
+
+local text =  
+    safeText(object.Text)  
+
+if shouldReplaceText(text) then  
+    pcall(function()  
+        object.Text =  
+            replacePlayerText(  
+                text  
+            )  
+    end)  
+end
+
+end
+local function anonymizeGuiRoot(root)
+ if not root then
+ return
+ end
+for _, object in ipairs(  
+    root:GetDescendants()  
+) do  
+    if object:IsA("TextLabel")  
+        or object:IsA("TextButton")  
+        or object:IsA("TextBox") then  
+
+        anonymizeTextObject(  
+            object  
+        )  
+    end  
+end
+
+end
+setCharacterAnonymous = function(
+ enabled
+ )
+ local char =
+ getCharacter()
+if not char then  
+    return  
+end  
+
+local hum =  
+    char:FindFirstChildOfClass(  
+        "Humanoid"  
+    )  
+
+if not hum then  
+    return  
+end  
+
+if OriginalDisplayName == nil then  
+    OriginalDisplayName =  
+        hum.DisplayName  
+end  
+
+if OriginalDisplayDistanceType  
+    == nil then  
+
+    OriginalDisplayDistanceType =  
+        hum.DisplayDistanceType  
+end  
+
+if enabled then  
+    pcall(function()  
+        hum.DisplayName =  
+            getPrivacyAlias()  
+    end)  
+
+    pcall(function()  
+        hum.DisplayDistanceType =  
+            Enum.HumanoidDisplayDistanceType.None  
+    end)  
+else  
+    pcall(function()  
+        hum.DisplayName =  
+            OriginalDisplayName  
+            or LP.DisplayName  
+    end)  
+
+    pcall(function()  
+        hum.DisplayDistanceType =  
+            OriginalDisplayDistanceType  
+            or Enum.HumanoidDisplayDistanceType.Viewer  
+    end)  
+end
+
+end
+
+-- Apply the full anonymous mode in one place. The previous version called
+-- applyAnonymousMode() but did not define it, so the toggle could fail early.
+local function applyAnonymousMode()
+    if S.anonymous then
+        pcall(function()
+            setCharacterAnonymous(true)
+        end)
+
+        pcall(function()
+            anonymizeGuiRoot(LP:FindFirstChild("PlayerGui"))
+        end)
+
+        pcall(function()
+            anonymizeGuiRoot(CoreGui)
+        end)
+    else
+        pcall(function()
+            setCharacterAnonymous(false)
+        end)
+    end
+end
+--============================================================
+ -- ANTI-STREAMING / TARGETED WIN-PAD PRESERVATION
+ --============================================================
+local AntiStreamingConnections = {}
+local antiStreamingRunning = false
+
+local function disconnectAntiStreaming()
+    for _, connection in ipairs(AntiStreamingConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(AntiStreamingConnections)
+    antiStreamingRunning = false
+end
+
+local function makeModelPersistent(model)
+    if not model or not model:IsA("Model") then return end
+    pcall(function()
+        model.ModelStreamingMode = Enum.ModelStreamingMode.Persistent
+    end)
+end
+
+local function applyAntiStreamingProperties()
+    if not S.antiStreaming then return end
+    -- Do not modify Workspace streaming radii globally. Large hidden radii can
+    -- retain huge parts of the map and cause memory pressure on mobile.
+    -- Targeted RequestStreamAroundAsync calls and the pad cache handle routing.
+
+    -- Only preserve GiveWins pad models. Do NOT mark every Workspace model
+    -- Persistent; that was the main memory-pressure problem in v11.
+    local folder = getGiveWinsFolder()
+    if folder then
+        for _, candidate in ipairs(collectPadCandidates(folder)) do
+            local root = candidate.root
+            if root:IsA("Model") then
+                makeModelPersistent(root)
+            else
+                local ancestorModel = root:FindFirstAncestorOfClass("Model")
+                if ancestorModel and ancestorModel:IsDescendantOf(folder) then
+                    makeModelPersistent(ancestorModel)
+                end
+            end
+        end
+    end
+end
+
+local function setupAntiStreaming()
+    disconnectAntiStreaming()
+    if not S.antiStreaming then return end
+
+    applyAntiStreamingProperties()
+
+    local folder = getGiveWinsFolder()
+    if folder then
+        pcall(function()
+            table.insert(AntiStreamingConnections, folder.DescendantAdded:Connect(function(descendant)
+                if not S.antiStreaming then return end
+                local index = numericName(descendant.Name)
+                if index and descendant:IsA("Model") then
+                    makeModelPersistent(descendant)
+                elseif descendant:IsA("Model") then
+                    local parentModel = descendant:FindFirstAncestorOfClass("Model")
+                    if parentModel and parentModel:IsDescendantOf(folder) then
+                        makeModelPersistent(parentModel)
+                    end
+                end
+            end))
+        end)
+    end
+
+    antiStreamingRunning = true
+    task.spawn(function()
+        while S.alive and S.antiStreaming and antiStreamingRunning do
+            -- Re-apply only the lightweight, targeted settings.
+            pcall(applyAntiStreamingProperties)
+            task.wait(10)
+        end
+    end)
+end
+
+--============================================================
+ -- GAMEPLAY PAUSED REMOVER
+ --============================================================
+local OriginalGameplayPausedNotificationEnabled
+local GameplayPausedConnections = {}
+
+pcall(function()
+    OriginalGameplayPausedNotificationEnabled = GuiService:GetGameplayPausedNotificationEnabled()
+end)
+
+local function disconnectGameplayPaused()
+    for _, connection in ipairs(GameplayPausedConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(GameplayPausedConnections)
+end
+
+local function disableGameplayPausedNotification()
+    pcall(function() GuiService:SetGameplayPausedNotificationEnabled(false) end)
+end
+
+local function destroyNetworkPauseObject()
+    pcall(function()
+        local RobloxGui = CoreGui:FindFirstChild("RobloxGui")
+        if not RobloxGui then return end
+
+        local direct = RobloxGui:FindFirstChild("CoreScripts/NetworkPause")
+        if direct then
+            direct:Destroy()
+        end
+        local nested = RobloxGui:FindFirstChild("NetworkPause", true)
+        if nested then
+            pcall(function() nested:Destroy() end)
+        end
+    end)
+end
+
+local function setupGameplayPausedWatcher()
+    disconnectGameplayPaused()
+
+    if not S.removeGameplayPaused then
+        if OriginalGameplayPausedNotificationEnabled ~= nil then
+            pcall(function()
+                GuiService:SetGameplayPausedNotificationEnabled(OriginalGameplayPausedNotificationEnabled)
+            end)
+        end
+        return
+    end
+
+    disableGameplayPausedNotification()
+    destroyNetworkPauseObject()
+
+    -- GameplayPaused belongs to Player, not GuiService.
+    pcall(function()
+        table.insert(GameplayPausedConnections, LP:GetPropertyChangedSignal("GameplayPaused"):Connect(function()
+            if S.removeGameplayPaused then
+                disableGameplayPausedNotification()
+                destroyNetworkPauseObject()
+            end
+        end))
+    end)
+
+    pcall(function()
+        local RobloxGui = CoreGui:FindFirstChild("RobloxGui")
+        if RobloxGui then
+            table.insert(GameplayPausedConnections, RobloxGui.DescendantAdded:Connect(function(object)
+                if S.removeGameplayPaused and (object.Name == "NetworkPause" or object.Name == "CoreScripts/NetworkPause") then
+                    task.defer(destroyNetworkPauseObject)
+                end
+            end))
+        end
+    end)
+
+    pcall(function()
+        table.insert(GameplayPausedConnections, LP.CharacterAdded:Connect(function()
+            task.delay(0.2, function()
+                if S.removeGameplayPaused then
+                    disableGameplayPausedNotification()
+                    destroyNetworkPauseObject()
+                end
+            end)
+        end))
+    end)
+
+    task.spawn(function()
+        while S.alive and S.removeGameplayPaused do
+            destroyNetworkPauseObject()
+            task.wait(2)
+        end
+    end)
+end
+
+--============================================================
+ -- ANONYMOUS UI WATCHER
+ --============================================================
+ local PrivacyConnections = {}
+local function privacyConnect(
+ signal,
+ callback
+ )
+ if not signal then
+ return
+ end
+local ok, connection =  
+    pcall(function()  
+        return signal:Connect(  
+            callback  
+        )  
+    end)  
+
+if ok and connection then  
+    table.insert(  
+        PrivacyConnections,  
+        connection  
+    )  
+end
+
+end
+local function disconnectPrivacy()
+ for _, connection in ipairs(
+ PrivacyConnections
+ ) do
+ pcall(function()
+ connection:Disconnect()
+ end)
+ end
+table.clear(  
+    PrivacyConnections  
+)
+
+end
+local function setupPrivacyWatcher()
+ disconnectPrivacy()
+if not S.anonymous then  
+    return  
+end  
+
+local playerGui =  
+    LP:FindFirstChild(  
+        "PlayerGui"  
+    )  
+
+if playerGui then  
+    privacyConnect(  
+        playerGui.DescendantAdded,  
+        function(object)  
+            task.defer(function()  
+                if S.anonymous then  
+                    anonymizeTextObject(  
+                        object  
+                    )  
+                end  
+            end)  
+        end  
+    )  
+end  
+
+task.spawn(function()
+    while S.alive and S.anonymous do
+        pcall(function()
+            anonymizeGuiRoot(LP:FindFirstChild("PlayerGui"))
+        end)
+        pcall(function()
+            anonymizeGuiRoot(CoreGui)
+        end)
+        pcall(function()
+            setCharacterAnonymous(true)
+        end)
+        task.wait(1.25)
+    end
+end)
+
+pcall(function()  
+    privacyConnect(  
+        CoreGui.DescendantAdded,  
+        function(object)  
+            task.defer(function()  
+                if S.anonymous then  
+                    anonymizeTextObject(  
+                        object  
+                    )  
+                end  
+            end)  
+        end  
+    )  
+end)  
+
+privacyConnect(  
+    LP.CharacterAdded,  
+    function()  
+        task.wait(0.2)  
+
+        if not S.alive then  
+            return  
+        end  
+
+        if S.anonymous then  
+            if setCharacterAnonymous then  
+                setCharacterAnonymous(  
+                    true  
+                )  
+            end  
+
+            applyAnonymousMode()  
+        end  
+    end  
+)
+
+end
+--============================================================
+ -- PERFORMANCE / MOBILE / QUALITY OF LIFE
+ --============================================================
+local OriginalPerformanceState = {}
+local PerformanceConnections = {}
+local AntiAfkConnection
+
+local function performanceStore(object, property)
+    if not object or not object.Parent then return end
+
+    local bucket = OriginalPerformanceState[object]
+    if not bucket then
+        bucket = {}
+        OriginalPerformanceState[object] = bucket
+    end
+
+    if bucket[property] == nil then
+        local ok, value = pcall(function() return object[property] end)
+        if ok then bucket[property] = value end
+    end
+end
+
+local function optimizeObject(object)
+    if not S.mobileOptimize or not object then return end
+
+    if object:IsA("ParticleEmitter")
+        or object:IsA("Trail")
+        or object:IsA("Beam")
+        or object:IsA("Smoke")
+        or object:IsA("Fire")
+        or object:IsA("Sparkles")
+        or object:IsA("PostEffect") then
+
+        performanceStore(object, "Enabled")
+        pcall(function() object.Enabled = false end)
+    end
+end
+
+local function disconnectPerformanceConnections()
+    for _, connection in ipairs(PerformanceConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(PerformanceConnections)
+end
+
+local function applyMobileOptimization(enabled)
+    S.mobileOptimize = enabled == true
+    disconnectPerformanceConnections()
+
+    if not S.mobileOptimize then
+        for object, properties in pairs(OriginalPerformanceState) do
+            if object and object.Parent then
+                for property, value in pairs(properties) do
+                    pcall(function() object[property] = value end)
+                end
+            end
+        end
+        table.clear(OriginalPerformanceState)
+
+        pcall(function()
+            local terrain = WS:FindFirstChildOfClass("Terrain")
+            if terrain then
+                local original = terrain:GetAttribute("_NHookOriginalDecoration")
+                if original ~= nil then terrain.Decoration = original end
+                terrain:SetAttribute("_NHookOriginalDecoration", nil)
+            end
+        end)
+
+        pcall(function()
+            local original = Lighting:GetAttribute("_NHookOriginalGlobalShadows")
+            if original ~= nil then Lighting.GlobalShadows = original end
+            Lighting:SetAttribute("_NHookOriginalGlobalShadows", nil)
+        end)
+        return
+    end
+
+    -- Intentionally lightweight: never scan all of Workspace at startup.
+    pcall(function()
+        if Lighting:GetAttribute("_NHookOriginalGlobalShadows") == nil then
+            Lighting:SetAttribute("_NHookOriginalGlobalShadows", Lighting.GlobalShadows)
+        end
+        Lighting.GlobalShadows = false
+    end)
+
+    pcall(function()
+        local terrain = WS:FindFirstChildOfClass("Terrain")
+        if terrain then
+            if terrain:GetAttribute("_NHookOriginalDecoration") == nil then
+                terrain:SetAttribute("_NHookOriginalDecoration", terrain.Decoration)
+            end
+            terrain.Decoration = false
+        end
+    end)
+
+    pcall(function()
+        table.insert(
+            PerformanceConnections,
+            Lighting.DescendantAdded:Connect(optimizeObject)
+        )
+    end)
+
+    local character = LP.Character
+    if character then
+        pcall(function()
+            for _, object in ipairs(character:GetDescendants()) do
+                optimizeObject(object)
+            end
+        end)
+        pcall(function()
+            table.insert(
+                PerformanceConnections,
+                character.DescendantAdded:Connect(optimizeObject)
+            )
+        end)
+    end
+end
+
+local function getSetFpsCap()
+    for _, name in ipairs({"setfpscap", "set_fps_cap"}) do
+        local fn
+        pcall(function()
+            if type(getgenv) == "function" then
+                local env = getgenv()
+                if env then fn = env[name] end
+            end
+        end)
+        if type(fn) ~= "function" then pcall(function() fn = _G[name] end) end
+        if type(fn) == "function" then return fn end
+    end
+    return nil
+end
+
+local function setFPSUnlock(enabled)
+    S.fpsUnlock = enabled == true
+    local setCap = getSetFpsCap()
+    if not setCap then return false end
+    return pcall(setCap, enabled and 0 or 60)
+end
+
+local function setupAntiAfk(enabled)
+    if AntiAfkConnection then
+        pcall(function() AntiAfkConnection:Disconnect() end)
+        AntiAfkConnection = nil
+    end
+
+    S.antiAfk = enabled == true
+    if not S.antiAfk then return end
+
+    pcall(function()
+        AntiAfkConnection = LP.Idled:Connect(function()
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new(0, 0))
+            end)
+        end)
+    end)
+end
+
+--============================================================
+ -- SPEED POPUP FILTER
+ --============================================================
+local SpeedPopupConnections = {}
+local SpeedPopupState = {}
+local SpeedPopupPending = setmetatable({}, {__mode = "k"})
+
+local function disconnectSpeedPopupWatcher()
+    for _, connection in ipairs(SpeedPopupConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(SpeedPopupConnections)
+    table.clear(SpeedPopupPending)
+end
+
+local function restoreSpeedPopupState()
+    for object, visible in pairs(SpeedPopupState) do
+        if object and object.Parent then
+            pcall(function() object.Visible = visible end)
+        end
+    end
+    table.clear(SpeedPopupState)
+end
+
+local function isSpeedPopupText(value)
+    local textValue = tostring(value or ""):lower()
+    if not textValue:find("speed", 1, true) then return false end
+    return textValue:find("gained", 1, true) ~= nil
+        or textValue:find("gain", 1, true) ~= nil
+        or textValue:find("added", 1, true) ~= nil
+        or textValue:find("increase", 1, true) ~= nil
+        or textValue:find("earned", 1, true) ~= nil
+        or textValue:find("speed +", 1, true) ~= nil
+        or textValue:find("+speed", 1, true) ~= nil
+end
+
+local function suppressSpeedPopupObject(object)
+    if not S.hideSpeedPopups or not object or not object.Parent then return end
+    if not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then return end
+    if not isSpeedPopupText(object.Text) then return end
+    if SpeedPopupState[object] == nil then
+        SpeedPopupState[object] = object.Visible
+    end
+    pcall(function() object.Visible = false end)
+end
+
+local function setupSpeedPopupWatcher()
+    restoreSpeedPopupState()
+    disconnectSpeedPopupWatcher()
+    if not S.hideSpeedPopups then return end
+
+    local roots = {LP:FindFirstChild("PlayerGui"), CoreGui}
+    for _, root in ipairs(roots) do
+        if root then
+            pcall(function()
+                for _, object in ipairs(root:GetDescendants()) do
+                    suppressSpeedPopupObject(object)
+                end
+                table.insert(SpeedPopupConnections, root.DescendantAdded:Connect(function(object)
+                    if SpeedPopupPending[object] then return end
+                    SpeedPopupPending[object] = true
+                    task.defer(function()
+                        SpeedPopupPending[object] = nil
+                        suppressSpeedPopupObject(object)
+                    end)
+                end))
+            end)
+        end
+    end
+end
+
+--============================================================
+ -- OPTIONAL UI FILTERS
+ --============================================================
+local UIFilterConnections = {}
+local UIFilterState = {}
+
+local function disconnectUIFilters()
+    for _, connection in ipairs(UIFilterConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(UIFilterConnections)
+end
+
+local function restoreUIFilters()
+    for object, visible in pairs(UIFilterState) do
+        if object and object.Parent then
+            pcall(function() object.Visible = visible end)
+        end
+    end
+    table.clear(UIFilterState)
+end
+
+local function uiOwnText(object)
+    if not object then return "" end
+    local name = tostring(object.Name or ""):lower()
+    local text = ""
+    if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+        text = tostring(object.Text or ""):lower()
+    end
+    return name .. " " .. text
+end
+
+local function hideMatchingUI(object)
+    if not object or not object.Parent then return end
+    -- Only hide the actual text/control carrying the matching content.
+    -- Parent-text inheritance was causing unrelated labels to disappear.
+    if not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then
+        return
+    end
+    local text = uiOwnText(object)
+    local groupMatch = S.hideGroupPopups and (
+        text:find("join group", 1, true)
+        or text:find("join the group", 1, true)
+        or text:find("group reward", 1, true)
+        or text:find("group bonus", 1, true)
+    )
+    local p2wMatch = S.hideP2WButtons and (
+        text:find("gamepass", 1, true)
+        or text:find("game pass", 1, true)
+        or (text:find("shop", 1, true) and (text:find("robux", 1, true) or text:find("premium", 1, true) or text:find("product", 1, true)))
+        or (text:find("buy", 1, true) and (text:find("robux", 1, true) or text:find("product", 1, true) or text:find("pass", 1, true)))
+    )
+    if groupMatch or p2wMatch then
+        if UIFilterState[object] == nil then UIFilterState[object] = object.Visible end
+        pcall(function() object.Visible = false end)
+    end
+end
+
+local UIFilterPending = setmetatable({}, {__mode = "k"})
+local function scheduleUIFilter(object)
+    if not object or UIFilterPending[object] then return end
+    UIFilterPending[object] = true
+    task.defer(function()
+        UIFilterPending[object] = nil
+        if object and object.Parent then hideMatchingUI(object) end
+    end)
+end
+
+local function setupUIFilters()
+    restoreUIFilters()
+    disconnectUIFilters()
+    table.clear(UIFilterPending)
+    local roots = {LP:FindFirstChild("PlayerGui"), CoreGui}
+    for _, root in ipairs(roots) do
+        if root then
+            pcall(function()
+                for _, object in ipairs(root:GetDescendants()) do hideMatchingUI(object) end
+                table.insert(UIFilterConnections, root.DescendantAdded:Connect(scheduleUIFilter))
+            end)
+        end
+    end
+end
+
+pcall(setupUIFilters)
+
+--============================================================
+ -- KILL PART REMOVER
+ --============================================================
+local KillPartState = {}
+local KillPartConnections = {}
+
+local function disconnectKillPartWatcher()
+    for _, connection in ipairs(KillPartConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(KillPartConnections)
+end
+
+local function applyKillPartToObject(object, enabled)
+    if not object or not object:IsA("BasePart") then return end
+
+    if enabled then
+        if not KillPartState[object] then
+            KillPartState[object] = {
+                CanTouch = object.CanTouch,
+                CanCollide = object.CanCollide,
+                Transparency = object.Transparency,
+            }
+        end
+        pcall(function()
+            object.CanTouch = false
+            object.CanCollide = false
+            object.Transparency = 1
+        end)
+    else
+        local original = KillPartState[object]
+        if not original then return end
+        pcall(function()
+            object.CanTouch = original.CanTouch
+            object.CanCollide = original.CanCollide
+            object.Transparency = original.Transparency
+        end)
+        KillPartState[object] = nil
+    end
+end
+
+local function setupKillPartRemover(enabled)
+    disconnectKillPartWatcher()
+
+    if not enabled then
+        local restoreList = {}
+        for object in pairs(KillPartState) do
+            table.insert(restoreList, object)
+        end
+        for _, object in ipairs(restoreList) do
+            applyKillPartToObject(object, false)
+        end
+        return
+    end
+
+    local folder = WS:FindFirstChild("KillPart")
+    if not folder then return end
+
+    pcall(function()
+        for _, object in ipairs(folder:GetDescendants()) do
+            applyKillPartToObject(object, true)
+        end
+    end)
+
+    pcall(function()
+        table.insert(
+            KillPartConnections,
+            folder.DescendantAdded:Connect(function(object)
+                applyKillPartToObject(object, true)
+            end)
+        )
+    end)
+end
+
+--============================================================
+ -- EMOTE SYSTEM
+ --============================================================
+local EmoteNames = {}
+local EmoteSeen = {}
+
+local function refreshEmotes()
+    table.clear(EmoteNames)
+    table.clear(EmoteSeen)
+
+    local folder = RS:FindFirstChild("Emotes")
+    if folder then
+        for _, child in ipairs(folder:GetChildren()) do
+            addUniqueName(EmoteNames, EmoteSeen, child.Name)
+        end
+    end
+
+    table.sort(EmoteNames)
+    if not S.selectedEmote or not table.find(EmoteNames, S.selectedEmote) then
+        S.selectedEmote = EmoteNames[1]
+    end
+end
+
+local function playSelectedEmote(name)
+    local humanoid = getHumanoid()
+    name = name or S.selectedEmote
+
+    if not humanoid or not name or name == "" then
+        return false
+    end
+
+    local ok, result = pcall(function()
+        return humanoid:PlayEmoteAsync(name)
+    end)
+
+    if ok and result == true then
+        return true
+    end
+
+    -- Fallback for experiences that store an Animation under
+    -- ReplicatedStorage.Emotes instead of a HumanoidDescription emote.
+    local folder = RS:FindFirstChild("Emotes")
+    local container = folder and folder:FindFirstChild(name)
+    local animation
+
+    if container then
+        if container:IsA("Animation") then
+            animation = container
+        else
+            animation = container:FindFirstChildWhichIsA("Animation", true)
+        end
+    end
+
+    if not animation or animation.AnimationId == "" then
+        return false
+    end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then
+        local created = Instance.new("Animator")
+        created.Parent = humanoid
+        animator = created
+    end
+
+    local loaded, track = pcall(function()
+        return animator:LoadAnimation(animation)
+    end)
+
+    if not loaded or not track then
+        return false
+    end
+
+    pcall(function()
+        track:Play()
+    end)
+
+    return true
+end
+
+pcall(refreshEmotes)
+
+task.spawn(function()
+    while S.alive do
+        if S.emoteCycle and #EmoteNames > 0 then
+            S.selectedEmote = EmoteNames[math.random(1, #EmoteNames)]
+            playSelectedEmote(S.selectedEmote)
+            task.wait(math.max(tonumber(S.emoteCycleDelay) or 2, 0.5))
+        else
+            task.wait(0.2)
+        end
+    end
+end)
+--============================================================
+ -- WINDUI WINDOW
+ --============================================================
+local Window
+do
+    local ok, result = pcall(function()
+        return WindUI:CreateWindow({
+            Title = "N-Hook v5",
+            Author = "N-Hook",
+            Folder = "NHookV5",
+            Icon = "solar:wind-bold",
+            ToggleKey = Enum.KeyCode.K,
+        })
+    end)
+
+    if not ok or not result then
+        warn("[N-Hook v5] WindUI CreateWindow failed:")
+        warn(tostring(result))
+        return
+    end
+
+    Window = result
+end
+
+--============================================================
+-- REGISTER-PRESSURE FIX: each UI tab is separately scoped so Luau can reuse local registers.
+do
+ -- TAB: WIN FARM
+ --============================================================
+ local WinTab =
+ Window:Tab({
+ Title = "Win Farm",
+ Icon = "trophy",
+ })
+local PadSection =
+ WinTab:Section({
+ Title = "Pad Selection",
+ })
+local initialPadValues = padValues()
+padDD =
+ PadSection:Dropdown({
+ Title = "Select Win Pad",
+ Values = initialPadValues,
+ Value = nil,
+ AllowNone = true,
+ SearchBarEnabled = true,
+ Multi = false,  
+
+    Callback = function(value)
+        local pad = findPadFromLabel(value)
+        S.selectedPad = pad and pad.name or nil
+    end,  
+})
+
+PadSection:Button({
+ Title =
+ "Refresh Pad List",
+Callback = function()  
+    scanWinPads()  
+
+    pcall(function()  
+        if padDD  
+            and padDD.Refresh then  
+
+            padDD:Refresh(
+                padValues()
+            )
+
+            if S.selectedPad and PadNameToOption[S.selectedPad] and padDD.Select then
+                pcall(function()
+                    padDD:Select(PadNameToOption[S.selectedPad])
+                end)
+            end
+        end
+    end)
+
+
+    notify(  
+        "Rescan",  
+        (  
+            "Found %d pads in Workspace.GiveWins"  
+        ):format(  
+            #WinPads  
+        ),  
+        2  
+    )  
+end,
+
+})
+PadSection:Button({
+ Title = "Check All Expected Pads",
+ Callback = function()
+    scanWinPads()
+    local present = {}
+    for _, pad in ipairs(WinPads) do present[pad.index] = true end
+    local missing = {}
+    for i = 1, S.expectedPadCount do
+        if not present[i] and not WinPadCache[tostring(i)] then
+            missing[#missing + 1] = tostring(i)
+        end
+    end
+
+    if #missing == 0 then
+        notify("Win Pads", ("All %d pad entries are available live or cached."):format(S.expectedPadCount), 3)
+    else
+        notify("Win Pads", "Missing pad data: " .. table.concat(missing, ", "), 4)
+    end
+ end,
+})
+PadSection:Button({
+ Title = "Rebuild Pad Cache",
+ Callback = function()
+    scanWinPads()
+    saveWinPadCache()
+    notify("Win Pads", ("Saved %d detected pad positions."):format(#WinPads), 3)
+ end,
+})
+PadSection:Button({
+ Title =
+ "Teleport to Selected Pad",
+Callback = function()  
+    local pad =  
+        S.selectedPad  
+            and findPadFromName(  
+                S.selectedPad  
+            )  
+
+    if not pad then  
+        notify(  
+            "Pad",  
+            "No pad selected",  
+            2  
+        )  
+
+        return  
+    end  
+
+    local ok, reason = teleportToPad(pad, true, true)
+    if not ok then
+        notify("Pad", "Teleport failed: " .. tostring(reason), 2)
+    end  
+end,
+
+})
+PadSection:Button({
+ Title =
+ "Teleport to Highest Pad",
+Callback = function()  
+    local route = combinedPads()
+    if #route == 0 then
+        notify("Pad", "No live or cached pads found.", 2)
+        return
+    end
+
+    table.sort(route, function(a,b)
+        if a.amount == b.amount then return a.index > b.index end
+        return a.amount > b.amount
+    end)
+    local pad = route[1]
+    local ok, reason = teleportToPad(pad, true, true)
+    if not ok then
+        notify("Pad", "Teleport failed: " .. tostring(reason), 2)
+    end  
+end,
+
+})
+PadSection:Button({
+ Title =
+ "Teleport to Lowest Pad",
+Callback = function()  
+    local route = combinedPads()
+    if #route == 0 then
+        notify("Pad", "No live or cached pads found.", 2)
+        return
+    end
+
+    table.sort(route, function(a,b)
+        if a.amount == b.amount then return a.index < b.index end
+        return a.amount < b.amount
+    end)
+    local pad = route[1]
+    local ok, reason = teleportToPad(pad, true, true)
+    if not ok then
+        notify("Pad", "Teleport failed: " .. tostring(reason), 2)
+    end  
+end,
+
+})
+local FarmSec =
+ WinTab:Section({
+ Title = "Auto Farm",
+ })
+FarmSec:Toggle({
+ Title =
+ "Enable Win Farm",
+Value = false,  
+
+Callback = function(value)  
+    S.winFarm =  
+        value  
+end,
+
+})
+FarmSec:Toggle({
+ Title = "Semi-Auto Farm (Lowest → Highest)",
+ Value = false,
+ Callback = function(value)
+    S.semiAutoFarm = value == true
+    S.semiAutoRunId += 1
+    if S.semiAutoFarm then
+        S.winFarm = false
+        local runId = S.semiAutoRunId
+        task.spawn(function() runSemiAutoCycle(runId) end)
+    end
+ end,
+})
+FarmSec:Button({
+ Title = "Run Lowest → Highest Once",
+ Callback = function()
+    if S.semiAutoFarm then return end
+    S.semiAutoFarm = true
+    S.winFarm = false
+    S.semiAutoRunId += 1
+    local runId = S.semiAutoRunId
+    task.spawn(function() runSemiAutoCycle(runId) end)
+ end,
+})
+FarmSec:Toggle({
+ Title = "Streaming Assist / CFrame Fallback",
+ Value = true,
+ Callback = function(value) S.streamingAssist=value==true end,
+})
+FarmSec:Toggle({
+ Title =
+ "Teleport to Pads",
+Value = true,  
+
+Callback = function(value)  
+    S.tpPads =  
+        value  
+end,
+
+})
+FarmSec:Toggle({
+ Title =
+ "Only Touch Selected Pad",
+Value = false,  
+
+Callback = function(value)  
+    S.onlySelected =  
+        value  
+end,
+
+})
+FarmSec:Toggle({
+ Title =
+ "Reverse Order (Lowest First)",
+Value = false,  
+
+Callback = function(value)  
+    S.sortDesc =  
+        not value  
+
+    scanWinPads()  
+
+    pcall(function()  
+        if padDD  
+            and padDD.Refresh then  
+
+            padDD:Refresh(
+                padValues()
+            )
+
+            if S.selectedPad and PadNameToOption[S.selectedPad] and padDD.Select then
+                pcall(function()
+                    padDD:Select(PadNameToOption[S.selectedPad])
+                end)
+            end
+        end
+    end)
+
+end,
+
+})
+FarmSec:Toggle({
+ Title =
+ "Notify Each Touch",
+Value = false,  
+
+Callback = function(value)  
+    S.notifyTouch =  
+        value  
+end,
+
+})
+FarmSec:Toggle({
+ Title =
+ "Auto Rescan Pads",
+Value = true,  
+
+Callback = function(value)  
+    S.autoRescan =  
+        value  
+end,
+
+})
+FarmSec:Slider({
+ Title =
+ "Pad Delay (s)",
+Step = 0.01,  
+
+Value = {  
+    Min = 0.01,  
+    Max = 1,  
+    Default = 0.04,  
+},  
+
+Callback = function(value)  
+    S.padDelay =  
+        tonumber(value)  
+        or 0.04  
+end,
+
+})
+FarmSec:Slider({
+ Title =
+ "Min Pad Worth",
+Step = 100,  
+
+Value = {  
+    Min = 0,  
+    Max = 5000,  
+    Default = 0,  
+},  
+
+Callback = function(value)  
+    S.padFilter =  
+        tonumber(value)  
+        or 0  
+end,
+
+})
+FarmSec:Input({
+ Title =
+ "Stop At Wins (0 = off)",
+Value =  
+    "0",  
+
+Callback = function(  
+    textValue  
+)  
+    S.stopAtWins =  
+        tonumber(textValue)  
+        or 0  
+end,
+
+})
+--============================================================
+ -- UPGRADE WIN BUTTONS
+ --============================================================
+local UpgradeSec = WinTab:Section({ Title = "Upgrade Wins" })
+
+upgradeDD = UpgradeSec:Dropdown({
+    Title = "Select Upgrade Button",
+    Values = upgradeValues(),
+    Value = nil,
+    AllowNone = true,
+    SearchBarEnabled = true,
+    Multi = false,
+    Callback = function(value)
+        local button = findUpgrade(value)
+        S.selectedUpgrade = button and button.name or nil
+    end,
+})
+
+local function refreshUpgradeDropdown()
+    scanUpgradeButtons()
+    pcall(function()
+        if upgradeDD and upgradeDD.Refresh then
+            upgradeDD:Refresh(upgradeValues())
+        end
+    end)
+    if S.selectedUpgrade and not SelectedUpgradeToOption[S.selectedUpgrade] then
+        S.selectedUpgrade = nil
+    end
+end
+
+UpgradeSec:Button({
+    Title = "Refresh Upgrade Buttons",
+    Callback = function()
+        refreshUpgradeDropdown()
+        notify("Upgrade Wins", ("Detected %d buttons"):format(#UpgradeButtons), 2)
+    end,
+})
+
+UpgradeSec:Button({
+    Title = "Touch Selected Upgrade",
+    Callback = function()
+        local selected
+        for _, button in ipairs(UpgradeButtons) do
+            if button.name == S.selectedUpgrade then
+                selected = button
+                break
+            end
+        end
+
+        if not selected then
+            notify("Upgrade Wins", "No upgrade selected.", 2)
+            return
+        end
+
+        streamAhead(selected.part.Position)
+        pcall(function()
+            local hrp = getHRP()
+            if hrp then
+                hrp.CFrame = CFrame.new(
+                    selected.part.Position + Vector3.new(0, 2.5, 0)
+                )
+            end
+        end)
+        touchPart(selected.part)
+    end,
+})
+
+UpgradeSec:Toggle({
+    Title = "Auto Touch All Upgrade Buttons",
+    Value = false,
+    Callback = function(value)
+        S.upgradeFarm = value
+    end,
+})
+
+UpgradeSec:Slider({
+    Title = "Upgrade Delay (s)",
+    Step = 0.01,
+    Value = { Min = 0.02, Max = 1, Default = 0.15 },
+    Callback = function(value)
+        S.upgradeDelay = tonumber(value) or 0.15
+    end,
+})
+
+--============================================================
+ -- WIN FARM STATS
+ --============================================================
+ local StatsSec =
+ WinTab:Section({
+ Title = "Stats",
+ })
+local statLabel =
+ StatsSec:Paragraph({
+ Title = "Status",
+ Desc = "Loading...",
+ })
+task.spawn(function()
+ while S.alive do
+ if statLabel then
+ pcall(function()
+ setParagraphDesc(statLabel, 
+ (
+ "Wins: %s | Farm: %s | Touches: %d | Pads: %d"
+ ):format(
+ fmt(
+ getStat(
+ "Wins"
+ )
+ ),
+S.winFarm  
+                        and "ON"  
+                        or "OFF",  
+
+                    farm.touches,  
+
+                    #WinPads  
+                )  
+            )  
+        end)  
+    end  
+
+    task.wait(0.5)  
+end
+
+end)
+StatsSec:Button({
+ Title =
+ "Reset Touch Counter",
+Callback = function()  
+    farm.touches =  
+        0  
+end,
+
+})
+--============================================================
+end -- register-scope
+do
+ -- TAB: AUTO FARM
+ --============================================================
+ local AutoTab =
+ Window:Tab({
+ Title = "Auto Farm",
+ Icon = "refresh-cw",
+ })
+local ASec =
+ AutoTab:Section({
+ Title = "Automation",
+ })
+ASec:Toggle({
+ Title =
+ "Auto Level Up",
+Value = false,  
+
+Callback = function(value)  
+    S.autoLevel =  
+        value  
+end,
+
+})
+ASec:Toggle({
+ Title =
+ "Auto Rebirth",
+Value = false,  
+
+Callback = function(value)  
+    S.autoRebirth =  
+        value  
+end,
+
+})
+ASec:Toggle({
+ Title =
+ "Auto Upgrade",
+Value = false,  
+
+Callback = function(value)  
+    S.autoUpgrade =  
+        value  
+end,
+
+})
+ASec:Toggle({
+ Title =
+ "Auto Claim Group Reward",
+Value = false,  
+
+Callback = function(value)  
+    S.autoClaim =  
+        value  
+end,
+
+})
+ASec:Toggle({
+ Title =
+ "Auto Ad Reward",
+Value = false,  
+
+Callback = function(value)  
+    S.autoAd =  
+        value  
+end,
+
+})
+ASec:Toggle({
+ Title =
+ "Auto Notification Spam",
+Value = false,  
+
+Callback = function(value)  
+    S.autoNotif =  
+        value  
+end,
+
+})
+ASec:Toggle({
+ Title =
+ "Auto Skip Tutorial",
+Value = false,  
+
+Callback = function(value)  
+    S.autoTutorial =  
+        value  
+end,
+
+})
+ASec:Slider({
+ Title =
+ "Loop Delay (s)",
+Step = 0.05,  
+
+Value = {  
+    Min = 0.05,  
+    Max = 5,  
+    Default = 0.5,  
+},  
+
+Callback = function(value)  
+    S.autoDelay =  
+        tonumber(value)  
+        or 0.5  
+end,
+
+})
+ASec:Button({
+ Title =
+ "Trigger All Once",
+Callback = function()  
+    invokeRemote(  
+        "RequestRebirth"  
+    )  
+
+    fireRemote(  
+        "UpgradeSuccess"  
+    )  
+
+    fireRemote(  
+        "ClaimGroupReward"  
+    )  
+
+    fireRemote(  
+        "AdRewardRequest"  
+    )  
+
+    fireRemote(  
+        "UpdateTutorialStep",  
+        999  
+    )  
+
+    notify(  
+        "AutoFarm",  
+        "Triggered all actions",  
+        2  
+    )  
+end,
+
+})
+--============================================================
+end -- register-scope
+do
+ -- TAB: MOVEMENT
+ --============================================================
+ local MoveTab =
+ Window:Tab({
+ Title = "Movement",
+ Icon = "wind",
+ })
+local MSec =
+ MoveTab:Section({
+ Title = "Character",
+ })
+MSec:Toggle({
+ Title =
+ "Infinite Jump (Wings Obby)",
+Value = false,  
+
+Callback = function(value)  
+    S.infJump =  
+        value  
+
+    if value then  
+        notify(  
+            "InfJump",  
+            "Space to flap / jump forever",  
+            2  
+        )  
+    end  
+end,
+
+})
+MSec:Toggle({
+ Title =
+ "Noclip",
+Value = false,  
+
+Callback = function(value)  
+    S.noclip =  
+        value  
+end,
+
+})
+MSec:Slider({
+ Title =
+ "WalkSpeed",
+Step = 1,  
+
+Value = {  
+    Min = 16,  
+    Max = 500,  
+    Default = 32,  
+},  
+
+Callback = function(value)  
+    S.walkSpeed =  
+        tonumber(value)  
+        or 32  
+
+    local hum =  
+        getHumanoid()  
+
+    if hum then  
+        pcall(function()  
+            hum.WalkSpeed =  
+                S.walkSpeed  
+        end)  
+    end  
+end,
+
+})
+MSec:Slider({
+ Title =
+ "JumpPower",
+Step = 1,  
+
+Value = {  
+    Min = 50,  
+    Max = 500,  
+    Default = 50,  
+},  
+
+Callback = function(value)  
+    S.jumpPower =  
+        tonumber(value)  
+        or 50  
+
+    local hum =  
+        getHumanoid()  
+
+    if hum then  
+        pcall(function()  
+            hum.UseJumpPower =  
+                true  
+
+            hum.JumpPower =  
+                S.jumpPower  
+        end)  
+    end  
+end,
+
+})
+MSec:Slider({
+ Title =
+ "HipHeight",
+Step = 0.1,  
+
+Value = {  
+    Min = -5,  
+    Max = 20,  
+    Default = 2,  
+},  
+
+Callback = function(value)  
+    S.hipHeight =  
+        tonumber(value)  
+        or 2  
+
+    local hum =  
+        getHumanoid()  
+
+    if hum then  
+        pcall(function()  
+            hum.HipHeight =  
+                S.hipHeight  
+        end)  
+    end  
+end,
+
+})
+MSec:Button({
+ Title =
+ "Reset Character",
+Callback = function()  
+    local hum =  
+        getHumanoid()  
+
+    if hum then  
+        pcall(function()  
+            hum.Health =  
+                0  
+        end)  
+    end  
+end,
+
+})
+MSec:Button({
+ Title =
+ "Reset Jump State",
+Callback = function()  
+    local hum =  
+        getHumanoid()  
+
+    if hum then  
+        pcall(function()  
+            hum:ChangeState(  
+                Enum.HumanoidStateType.Jumping  
+            )  
+
+            task.wait(  
+                0.05  
+            )  
+
+            hum:ChangeState(  
+                Enum.HumanoidStateType.GettingUp  
+            )  
+        end)  
+    end  
+end,
+
+})
+local FlySec =
+ MoveTab:Section({
+ Title = "Fly",
+ })
+FlySec:Toggle({
+ Title =
+ "Enable Fly (WASD + Space/Ctrl)",
+Value = false,  
+
+Callback = function(value)  
+    S.fly = value == true
+    setMobileFlyControls(S.fly)
+
+    if not S.fly then  
+        stopFly()  
+    end  
+end,
+
+})
+FlySec:Slider({
+ Title =
+ "Fly Speed",
+Step = 1,  
+
+Value = {  
+    Min = 10,  
+    Max = 500,  
+    Default = 100,  
+},  
+
+Callback = function(value)  
+    S.flySpeed =  
+        tonumber(value)  
+        or 100  
+end,
+
+})
+--============================================================
+end -- register-scope
+do
+ -- TAB: SPEED
+ --============================================================
+ local SpeedTab =
+ Window:Tab({
+ Title = "Speed",
+ Icon = "zap",
+ })
+local SSec =
+ SpeedTab:Section({
+ Title = "Speed Spam",
+ })
+SSec:Toggle({
+ Title =
+ "Enable Speed Spam",
+Value = false,  
+
+Callback = function(value)  
+    S.speedSpam =  
+        value  
+end,
+
+})
+SSec:Dropdown({
+ Title = "Speed Spam Burst",
+ Values = {"x5","x10","x25","x50","x100","x500","x1K","x5K","x10K","x50K","x100K","x500K","x1M","x5M","x10M","x50M","x100M","x500M"},
+ Value = "x500",
+ Callback = function(value)
+    local raw=tostring(value or "x500"):lower():gsub("x","")
+    local n=tonumber(raw:gsub("k","")) or 500
+    if raw:find("k",1,true) then n=n*1000 end
+    if raw:find("m",1,true) then n=n*1000000 end
+    S.speedBurst=math.clamp(math.floor(n),5,500000000)
+ end,
+})
+SSec:Button({
+ Title = "Fire Selected Burst",
+ Callback = function()
+    if S.speedBurstRunning then
+        notify("Speed", "A burst is already running.", 2)
+        return
+    end
+    local total = math.clamp(math.floor(tonumber(S.speedBurst) or 500), 5, 500000000)
+    S.speedBurstCancel = false
+    S.speedBurstRunning = true
+    task.spawn(function()
+        local sent = 0
+        local consecutiveFailures = 0
+        while sent < total and S.alive and not S.speedBurstCancel do
+            local batch = math.min(250, total - sent)
+            for _ = 1, batch do
+                if not S.alive or S.speedBurstCancel then break end
+                local ok = fireRemote("AddSpeed")
+                if ok then
+                    sent += 1
+                    consecutiveFailures = 0
+                else
+                    consecutiveFailures += 1
+                    if consecutiveFailures >= 25 then
+                        notify("Speed", "AddSpeed remote unavailable; burst stopped.", 3)
+                        S.speedBurstCancel = true
+                        break
+                    end
+                end
+            end
+            task.wait()
+        end
+        S.speedBurstRunning = false
+    end)
+ end,
+})
+SSec:Button({
+ Title = "Cancel Current Burst",
+ Callback = function()
+    S.speedBurstCancel = true
+ end,
+})
+SSec:Slider({
+ Title =
+ "Delay between FireServer (s)",
+Step = 0.005,  
+
+Value = {  
+    Min = 0.005,  
+    Max = 1,  
+    Default = 0.03,  
+},  
+
+Callback = function(value)  
+    S.speedDelay =  
+        tonumber(value)  
+        or 0.03  
+end,
+
+})
+SSec:Button({
+ Title =
+ "Fire AddSpeed x50",
+Callback = function()  
+    for _ = 1, 50 do  
+        fireRemote(  
+            "AddSpeed"  
+        )  
+    end  
+
+    notify(  
+        "Speed",  
+        "Fired 50x",  
+        2  
+    )  
+end,
+
+})
+SSec:Button({
+ Title =
+ "Fire AddSpeed x500",
+Callback = function()  
+    task.spawn(function()  
+        for i = 1, 500 do
+            if not S.alive then break end
+            fireRemote("AddSpeed")
+            if i % 25 == 0 then task.wait() end
+        end  
+    end)  
+
+    notify(  
+        "Speed",  
+        "Fired 500x",  
+        2  
+    )  
+end,
+
+})
+SSec:Button({
+ Title =
+ "Fire AddSpeed x5000",
+Callback = function()  
+    task.spawn(function()  
+        for i = 1, 5000 do
+            if not S.alive then break end
+            fireRemote("AddSpeed")
+            if i % 10 == 0 then task.wait() end
+        end  
+    end)  
+
+    notify(  
+        "Speed",  
+        "Fired 5000x",  
+        2  
+    )  
+end,
+
+})
+local SpdInfo =
+ SpeedTab:Section({
+ Title = "Status",
+ })
+local spdLabel =
+ SpdInfo:Paragraph({
+ Title = "Speed",
+ Desc = "...",
+ })
+task.spawn(function()
+ while S.alive do
+ if spdLabel then
+ pcall(function()
+ setParagraphDesc(spdLabel, 
+ (
+ "Current: %s | Spam: %s @ %.3fs"
+ ):format(
+ fmt(
+ getStat(
+ "Speed"
+ )
+ ),
+S.speedSpam  
+                        and "ON"  
+                        or "OFF",  
+
+                    S.speedDelay  
+                )  
+            )  
+        end)  
+    end  
+
+    task.wait(0.5)  
+end
+
+end)
+--============================================================
+end -- register-scope
+do
+ -- TAB: AURAS
+ --============================================================
+ local AuraTab =
+ Window:Tab({
+ Title = "Auras",
+ Icon = "sparkles",
+ })
+local auraDD
+local AuraSection =
+ AuraTab:Section({
+ Title = "Aura Controls",
+ })
+AuraSection:Toggle({
+ Title =
+ "Equip All Auras (spam)",
+Value = false,  
+
+Callback = function(value)  
+    S.auraEquipAll =  
+        value  
+end,
+
+})
+AuraSection:Toggle({
+ Title =
+ "Attempt Buy All Auras",
+Value = false,  
+
+Callback = function(value)  
+    S.auraBuy =  
+        value  
+end,
+
+})
+AuraSection:Toggle({
+ Title =
+ "Cycle Auras Randomly",
+Value = false,  
+
+Callback = function(value)  
+    S.auraCycle =  
+        value  
+end,
+
+})
+AuraSection:Toggle({
+    Title = "Owned Auras Only",
+    Value = false,
+    Callback = function(value)
+        S.ownedAurasOnly = value
+        pcall(function()
+            if auraDD and auraDD.Refresh then
+                auraDD:Refresh(getAuraDropdownValues())
+                if S.selectedAura and auraDD.Select then
+                    pcall(function() auraDD:Select(S.selectedAura) end)
+                end
+            end
+        end)
+    end,
+})
+
+AuraSection:Slider({
+ Title =
+ "Cycle Delay (s)",
+Step = 0.1,  
+
+Value = {  
+    Min = 0.2,  
+    Max = 10,  
+    Default = 1.5,  
+},  
+
+Callback = function(value)  
+    S.auraCycleDelay =  
+        tonumber(value)  
+        or 1.5  
+end,
+
+})
+AuraSection:Button({
+ Title =
+ "Equip All Auras Once",
+Callback = function()  
+    task.spawn(function()  
+        for _, name in ipairs(  
+            AuraNames  
+        ) do  
+            if not S.alive then  
+                break  
+            end  
+
+            fireRemote(  
+                "CarAction",  
+                "Equip",  
+                name  
+            )  
+
+            task.wait(  
+                0.03  
+            )  
+        end  
+
+        notify(  
+            "Auras",  
+            "Equipped "  
+                .. #AuraNames  
+                .. " auras",  
+            2  
+        )  
+    end)  
+end,
+
+})
+AuraSection:Button({
+ Title =
+ "Force Equip Every Aura x10",
+Callback = function()  
+    task.spawn(function()  
+        for _ = 1, 10 do  
+            if not S.alive then  
+                break  
+            end  
+
+            for _, name in ipairs(  
+                AuraNames  
+            ) do  
+                fireRemote(  
+                    "CarAction",  
+                    "Equip",  
+                    name  
+                )  
+            end  
+
+            task.wait(  
+                0.1  
+            )  
+        end  
+    end)  
+end,
+
+})
+local ADrop =
+ AuraTab:Section({
+ Title = "Single Aura",
+ })
+local AuraDropdownValues = getAuraDropdownValues()
+auraDD = ADrop:Dropdown({
+ Title = "Pick Aura",
+Values =  
+        AuraDropdownValues,  
+
+    Value = S.selectedAura,
+    AllowNone = true,
+    SearchBarEnabled = true,
+
+    Callback = function(value)
+        value = normalizeDropdownValue(value)
+        if value == "No auras detected"
+            or value == "No owned auras detected"
+            or value == nil then
+            S.selectedAura = nil
+            return
+        end
+        S.selectedAura = value
+    end,  
+})
+
+ADrop:Button({
+ Title =
+ "Equip Selected Aura",
+Callback = function()  
+    if S.selectedAura then  
+        fireRemote(  
+            "CarAction",  
+            "Equip",  
+            S.selectedAura  
+        )  
+    else  
+        notify(  
+            "Auras",  
+            "No aura selected.",  
+            2  
+        )  
+    end  
+end,
+
+})
+ADrop:Button({
+ Title =
+ "Try Buy Selected Aura",
+Callback = function()  
+    if S.selectedAura then  
+        fireRemote(  
+            "CarAction",  
+            "Buy",  
+            S.selectedAura  
+        )  
+
+        fireRemote(  
+            "CarAction",  
+            "Purchase",  
+            S.selectedAura  
+        )  
+    else  
+        notify(  
+            "Auras",  
+            "No aura selected.",  
+            2  
+        )  
+    end  
+end,
+
+})
+--============================================================
+end -- register-scope
+do
+ -- TAB: TRAILS
+ --============================================================
+ local TrailTab =
+ Window:Tab({
+ Title = "Trails",
+ Icon = "move",
+ })
+local trailDD
+local TrailSection =
+ TrailTab:Section({
+ Title = "Trail Controls",
+ })
+TrailSection:Toggle({
+ Title =
+ "Equip All Trails (spam)",
+Value = false,  
+
+Callback = function(value)  
+    S.trailEquipAll =  
+        value  
+end,
+
+})
+TrailSection:Toggle({
+ Title =
+ "Attempt Buy All Trails",
+Value = false,  
+
+Callback = function(value)  
+    S.trailBuy =  
+        value  
+end,
+
+})
+TrailSection:Toggle({
+ Title =
+ "Cycle Trails Randomly",
+Value = false,  
+
+Callback = function(value)  
+    S.trailCycle =  
+        value  
+end,
+
+})
+TrailSection:Toggle({
+    Title = "Owned Trails Only",
+    Value = false,
+    Callback = function(value)
+        S.ownedTrailsOnly = value
+        pcall(function()
+            if trailDD and trailDD.Refresh then
+                trailDD:Refresh(getTrailDropdownValues())
+                if S.selectedTrail and trailDD.Select then
+                    pcall(function() trailDD:Select(S.selectedTrail) end)
+                end
+            end
+        end)
+    end,
+})
+
+TrailSection:Slider({
+ Title =
+ "Cycle Delay (s)",
+Step = 0.1,  
+
+Value = {  
+    Min = 0.2,  
+    Max = 10,  
+    Default = 1.5,  
+},  
+
+Callback = function(value)  
+    S.trailCycleDelay =  
+        tonumber(value)  
+        or 1.5  
+end,
+
+})
+TrailSection:Button({
+ Title =
+ "Equip All Trails Once",
+Callback = function()  
+    task.spawn(function()  
+        for _, name in ipairs(  
+            TrailNames  
+        ) do  
+            if not S.alive then  
+                break  
+            end  
+
+            fireRemote(  
+                "TrailAction",  
+                "Equip",  
+                name  
+            )  
+
+            task.wait(  
+                0.03  
+            )  
+        end  
+
+        notify(  
+            "Trails",  
+            "Equipped "  
+                .. #TrailNames  
+                .. " trails",  
+            2  
+        )  
+    end)  
+end,
+
+})
+TrailSection:Button({
+ Title =
+ "Force Equip Every Trail x10",
+Callback = function()  
+    task.spawn(function()  
+        for _ = 1, 10 do  
+            if not S.alive then  
+                break  
+            end  
+
+            for _, name in ipairs(  
+                TrailNames  
+            ) do  
+                fireRemote(  
+                    "TrailAction",  
+                    "Equip",  
+                    name  
+                )  
+            end  
+
+            task.wait(  
+                0.1  
+            )  
+        end  
+    end)  
+end,
+
+})
+local TDrop =
+ TrailTab:Section({
+ Title = "Single Trail",
+ })
+local TrailDropdownValues = getTrailDropdownValues()
+trailDD = TDrop:Dropdown({
+ Title = "Pick Trail",
+Values =  
+        TrailDropdownValues,  
+
+    Value = S.selectedTrail,
+    AllowNone = true,
+    SearchBarEnabled = true,
+
+    Callback = function(value)
+        value = normalizeDropdownValue(value)
+        if value == "No trails detected"
+            or value == "No owned trails detected"
+            or value == nil then
+            S.selectedTrail = nil
+            return
+        end
+        S.selectedTrail = value
+    end,  
+})
+
+TDrop:Button({
+ Title =
+ "Equip Selected Trail",
+Callback = function()  
+    if S.selectedTrail then  
+        fireRemote(  
+            "TrailAction",  
+            "Equip",  
+            S.selectedTrail  
+        )  
+    else  
+        notify(  
+            "Trails",  
+            "No trail selected.",  
+            2  
+        )  
+    end  
+end,
+
+})
+TDrop:Button({
+ Title =
+ "Try Buy Selected Trail",
+Callback = function()  
+    if S.selectedTrail then  
+        fireRemote(  
+            "TrailAction",  
+            "Buy",  
+            S.selectedTrail  
+        )  
+
+        fireRemote(  
+            "TrailAction",  
+            "Purchase",  
+            S.selectedTrail  
+        )  
+    else  
+        notify(  
+            "Trails",  
+            "No trail selected.",  
+            2  
+        )  
+    end  
+end,
+
+})
+--============================================================
+end -- register-scope
+do
+ -- TAB: EMOTES
+ --============================================================
+local EmoteTab = Window:Tab({ Title = "Emotes", Icon = "smile" })
+local EmoteSec = EmoteTab:Section({ Title = "Emotes" })
+
+local emoteDD = EmoteSec:Dropdown({
+    Title = "Pick Emote",
+    Values = #EmoteNames > 0 and EmoteNames or {"No emotes detected"},
+    Value = S.selectedEmote,
+    AllowNone = true,
+    SearchBarEnabled = true,
+    Multi = false,
+    Callback = function(value)
+        value = normalizeDropdownValue(value)
+        if value == "No emotes detected" or value == nil then
+            S.selectedEmote = nil
+        else
+            S.selectedEmote = value
+        end
+    end,
+})
+
+EmoteSec:Button({
+    Title = "Play Selected Emote",
+    Callback = function()
+        if not playSelectedEmote() then
+            notify("Emotes", "Could not play that emote on this Humanoid.", 2)
+        end
+    end,
+})
+
+EmoteSec:Toggle({
+    Title = "Random Emote Cycle",
+    Value = false,
+    Callback = function(value)
+        S.emoteCycle = value
+    end,
+})
+
+EmoteSec:Slider({
+    Title = "Cycle Delay (s)",
+    Step = 0.1,
+    Value = { Min = 0.5, Max = 10, Default = 2 },
+    Callback = function(value)
+        S.emoteCycleDelay = tonumber(value) or 2
+    end,
+})
+
+EmoteSec:Button({
+    Title = "Refresh Emotes",
+    Callback = function()
+        refreshEmotes()
+        pcall(function()
+            if emoteDD and emoteDD.Refresh then
+                emoteDD:Refresh(#EmoteNames > 0 and EmoteNames or {"No emotes detected"})
+            end
+        end)
+    end,
+})
+
+EmoteSec:Paragraph({
+    Title = "About",
+    Desc = "Uses Humanoid:PlayEmoteAsync() when the emote is available to the character. ReplicatedStorage.Emotes alone does not guarantee server-wide playback.",
+})
+
+--============================================================
+end -- register-scope
+do
+ -- TAB: SETTINGS
+ --============================================================
+ local MiscTab =
+ Window:Tab({
+ Title = "Settings",
+ Icon = "settings",
+ })
+--============================================================
+ -- PRIVACY SECTION
+ --============================================================
+ local Privacy =
+ MiscTab:Section({
+ Title =
+ "Privacy / Player Identity",
+ })
+local playerInfo =
+ Privacy:Paragraph({
+ Title =
+ "Local Player",
+Desc =  
+        "Loading...",  
+})
+
+local function updatePlayerInfo()
+ if not playerInfo then
+ return
+ end
+local shownName  
+
+if S.anonymous then  
+    shownName =  
+        getPrivacyAlias()  
+else  
+    shownName =  
+        LP.Name  
+end  
+
+local display =  
+    LP.DisplayName  
+
+pcall(function()  
+    setParagraphDesc(playerInfo,   
+        (  
+            "Username: %s\nDisplay Name: %s\nUserId: %s"  
+        ):format(  
+            shownName,  
+            display,  
+            tostring(  
+                LP.UserId  
+            )  
+        )  
+    )  
+end)
+
+end
+updatePlayerInfo()
+Privacy:Toggle({
+ Title =
+ "Anonymous Mode",
+Value = false,  
+
+Callback = function(value)  
+    S.anonymous =  
+        value  
+
+    if value  
+        and S.randomAlias then  
+
+        S.alias =  
+            generateAlias()  
+    end  
+
+    applyAnonymousMode()  
+
+    setupPrivacyWatcher()  
+
+    updatePlayerInfo()  
+
+    notify(  
+        "Privacy",  
+        value  
+            and (  
+                "Anonymous mode enabled as "  
+                .. getPrivacyAlias()  
+            )  
+            or "Anonymous mode disabled",  
+        3  
+    )  
+end,
+
+})
+Privacy:Toggle({
+ Title =
+ "Randomize Alias",
+Value = true,  
+
+Callback = function(value)  
+    S.randomAlias =  
+        value  
+
+    if value then  
+        S.alias =  
+            generateAlias()  
+
+        if S.anonymous then  
+            applyAnonymousMode()  
+        end  
+
+        updatePlayerInfo()  
+    end  
+end,
+
+})
+Privacy:Input({
+ Title =
+ "Custom Anonymous Alias",
+Value =  
+    "",  
+
+Placeholder =  
+    "Leave empty for randomized alias",  
+
+Callback = function(value)  
+    S.customAlias =  
+        tostring(  
+            value or ""  
+        )  
+
+    if S.anonymous then  
+        applyAnonymousMode()  
+    end  
+
+    updatePlayerInfo()  
+end,
+
+})
+Privacy:Button({
+ Title =
+ "Generate New Random Alias",
+Callback = function()  
+    S.alias =  
+        generateAlias()  
+
+    S.customAlias =  
+        ""  
+
+    if S.anonymous then  
+        applyAnonymousMode()  
+    end  
+
+    updatePlayerInfo()  
+
+    notify(  
+        "Privacy",  
+        "New alias: "  
+            .. S.alias,  
+        2  
+    )  
+end,
+
+})
+Privacy:Button({
+ Title =
+ "Re-Scan Visible UI for Username",
+Callback = function()  
+    if not S.anonymous then  
+        notify(  
+            "Privacy",  
+            "Enable Anonymous Mode first.",  
+            2  
+        )  
+
+        return  
+    end  
+
+    applyAnonymousMode()  
+
+    notify(  
+        "Privacy",  
+        "Visible UI rescanned.",  
+        2  
+    )  
+end,
+
+})
+--============================================================
+ -- VISUAL SECTION
+ --============================================================
+ local Misc =
+ MiscTab:Section({
+ Title = "Visual",
+ })
+Misc:Toggle({
+ Title =
+ "Fullbright",
+Value = false,  
+
+Callback = function(value)  
+    S.fullbright =  
+        value  
+
+    if value then  
+        pcall(function()  
+            Lighting.Ambient =  
+                Color3.fromRGB(  
+                    255,  
+                    255,  
+                    255  
+                )  
+
+            Lighting.Brightness =  
+                2  
+
+            Lighting.OutdoorAmbient =  
+                Color3.fromRGB(  
+                    255,  
+                    255,  
+                    255  
+                )  
+        end)  
+    else  
+        restoreLighting()  
+    end  
+end,
+
+})
+Misc:Toggle({
+    Title = "Hide Speed Gain Popups",
+    Value = true,
+    Callback = function(value)
+        S.hideSpeedPopups = value
+        setupSpeedPopupWatcher()
+    end,
+})
+
+Misc:Toggle({
+    Title = "Hide Join Group Popups",
+    Value = true,
+    Callback = function(value)
+        S.hideGroupPopups = value == true
+        setupUIFilters()
+    end,
+})
+
+Misc:Toggle({
+    Title = "Hide P2W Shop / Gamepass UI",
+    Value = true,
+    Callback = function(value)
+        S.hideP2WButtons = value == true
+        setupUIFilters()
+    end,
+})
+
+Misc:Toggle({
+    Title = "Remove Kill Parts",
+    Value = false,
+    Callback = function(value)
+        S.removeKillParts = value
+        setupKillPartRemover(value)
+    end,
+})
+
+Misc:Toggle({
+    Title = "Mobile Optimization",
+    Value = false,
+    Callback = function(value)
+        applyMobileOptimization(value)
+    end,
+})
+
+Misc:Toggle({
+    Title = "FPS Unlocker",
+    Value = false,
+    Callback = function(value)
+        local ok = setFPSUnlock(value)
+        if not ok and value then
+            notify("FPS", "Executor FPS-cap API not available.", 3)
+        end
+    end,
+})
+
+Misc:Toggle({
+    Title = "Anti-AFK",
+    Value = false,
+    Callback = function(value)
+        setupAntiAfk(value)
+    end,
+})
+
+Misc:Toggle({
+    Title = "Stream Ahead Before Teleports",
+    Value = false,
+    Callback = function(value)
+        S.streamAhead = value
+    end,
+})
+
+Misc:Toggle({
+    Title = "Anti-Streaming",
+    Value = true,
+    Callback = function(value)
+        S.antiStreaming = value == true
+        setupAntiStreaming()
+    end,
+})
+Misc:Slider({
+    Title = "Anti-Streaming Radius",
+    Step = 256,
+    Value = {
+        Min = 1024,
+        Max = 20000,
+        Default = 4096,
+    },
+    Callback = function(value)
+        S.antiStreamingRadius = math.clamp(math.floor(tonumber(value) or 4096), 1024, 20000)
+        if S.antiStreaming then
+            applyAntiStreamingProperties()
+        end
+    end,
+})
+
+Misc:Toggle({
+    Title = 'Remove "Gameplay Paused"',
+    Value = true,
+    Callback = function(value)
+        S.removeGameplayPaused = value
+        setupGameplayPausedWatcher()
+    end,
+})
+Misc:Button({
+ Title =
+ "Remove Fog",
+Callback = function()  
+    pcall(function()  
+        Lighting.FogEnd =  
+            1e6  
+
+        Lighting.FogStart =  
+            0  
+    end)  
+end,
+
+})
+Misc:Button({
+ Title =
+ "Reset Lighting",
+Callback = function()  
+    restoreLighting()  
+end,
+
+})
+--============================================================
+ -- PLAYER INFORMATION SECTION
+ --============================================================
+ local PlayerSec =
+ MiscTab:Section({
+ Title =
+ "Player Information",
+ })
+local playerStatus =
+ PlayerSec:Paragraph({
+ Title =
+ "Player",
+Desc =  
+        "Loading...",  
+})
+
+task.spawn(function()
+ while S.alive do
+ if playerStatus then
+ pcall(function()
+ setParagraphDesc(playerStatus, 
+ (
+ "Username: %s\nDisplay: %s\nUserId: %s\nAccount Age: %s days"
+ ):format(
+ S.anonymous
+ and getPrivacyAlias()
+ or LP.Name,
+LP.DisplayName,  
+
+                    tostring(  
+                        LP.UserId  
+                    ),  
+
+                    tostring(  
+                        LP.AccountAge  
+                    )  
+                )  
+            )  
+        end)  
+    end  
+
+    task.wait(1)  
+end
+
+end)
+--============================================================
+ -- LIVE STATS
+ --============================================================
+ local MiscStats =
+ MiscTab:Section({
+ Title = "Stats",
+ })
+local miscLabel =
+ MiscStats:Paragraph({
+ Title = "Live",
+ Desc = "...",
+ })
+task.spawn(function()
+ while S.alive do
+ if miscLabel then
+ pcall(function()
+ setParagraphDesc(miscLabel, 
+ (
+ "Lv %s | Wins %s | Speed %s | Rebirths %s"
+ ):format(
+ fmt(
+ getStat(
+ "Level"
+ )
+ ),
+fmt(  
+                        getStat(  
+                            "Wins"  
+                        )  
+                    ),  
+
+                    fmt(  
+                        getStat(  
+                            "Speed"  
+                        )  
+                    ),  
+
+                    fmt(  
+                        getStat(  
+                            "Rebirths"  
+                        )  
+                    )  
+                )  
+            )  
+        end)  
+    end  
+
+    task.wait(0.5)  
+end
+
+end)
+--============================================================
+ -- AUTO-DETECTED PLAYER DATA
+ --============================================================
+local DetectedSec = MiscTab:Section({ Title = "Auto-Detected Player Data" })
+local detectedLabel = DetectedSec:Paragraph({ Title = "Folders", Desc = "Scanning..." })
+local wingLabel = DetectedSec:Paragraph({ Title = "Equipped Wings", Desc = "Scanning..." })
+
+local function getFolderCount(name)
+    local folder = LP:FindFirstChild(name)
+    if not folder then return 0, false end
+    return #folder:GetChildren(), true
+end
+
+local function getEquippedWingsObject()
+    local workspacePlayer = WS:FindFirstChild("LocalPlayer")
+    if workspacePlayer then
+        local wings = workspacePlayer:FindFirstChild("EquippedWings")
+        if wings then return wings end
+    end
+
+    local playerWings = LP:FindFirstChild("EquippedWings")
+    if playerWings then return playerWings end
+
+    local character = LP.Character
+    return character and character:FindFirstChild("EquippedWings")
+end
+
+task.spawn(function()
+    while S.alive do
+        pcall(function()
+            local parts = {}
+            for _, name in ipairs({"Cars", "OwnedProducts", "Trails", "Upgrades", "leaderstats"}) do
+                local count, exists = getFolderCount(name)
+                if exists then
+                    table.insert(parts, ("%s: %d"):format(name, count))
+                end
+            end
+            setParagraphDesc(detectedLabel, 
+                #parts > 0 and table.concat(parts, " | ")
+                    or "No supported player folders detected."
+            )
+        end)
+
+        pcall(function()
+            local wings = getEquippedWingsObject()
+            if not wings then
+                setParagraphDesc(wingLabel, "No EquippedWings object detected.")
+                return
+            end
+
+            setParagraphDesc(wingLabel, 
+                ("Object: %s\nIsWingModel: %s\nSourceWing: %s"):format(
+                    wings:GetFullName(),
+                    tostring(wings:GetAttribute("IsWingModel")),
+                    tostring(wings:GetAttribute("SourceWing"))
+                )
+            )
+        end)
+
+        task.wait(1)
+    end
+end)
+
+--============================================================
+ -- DISCORD / COMMUNITY
+ --============================================================
+ local DiscordSec =
+ MiscTab:Section({
+ Title =
+ "Discord / Feedback",
+ })
+DiscordSec:Paragraph({
+ Title =
+ "N-Hook v5 Discord",
+Desc =  
+    "Suggestions, bug reports, feature requests, and script feedback are welcome.\n\n"  
+        .. "If something breaks, send the error/output and explain what you were doing when it happened.",
+
+})
+DiscordSec:Button({
+ Title =
+ "Copy Discord Invite",
+Callback = function()  
+    local copied =  
+        copyToClipboard(  
+            DISCORD_INVITE  
+        )  
+
+    if copied then  
+        notify(  
+            "Discord",  
+            "Invite copied to clipboard.",  
+            3  
+        )  
+    else  
+        notify(  
+            "Discord",  
+            "Clipboard API unavailable. Invite: "  
+                .. DISCORD_INVITE,  
+            5  
+        )  
+    end  
+end,
+
+})
+DiscordSec:Button({
+ Title =
+ "Copy Invite + Feedback Message",
+Callback = function()  
+    local message =  
+        DISCORD_INVITE  
+            .. "\n\n"  
+            .. "N-Hook v5 Suggestions / Bugs:\n"  
+            .. "• What feature should be added?\n"  
+            .. "• What bug did you encounter?\n"  
+            .. "• What were you doing when it happened?\n"  
+            .. "• Include any error/output if available."  
+
+    local copied =  
+        copyToClipboard(  
+            message  
+        )  
+
+    if copied then  
+        notify(  
+            "Discord",  
+            "Invite + feedback template copied.",  
+            3  
+        )  
+    else  
+        notify(  
+            "Discord",  
+            "Clipboard API unavailable.",  
+            3  
+        )  
+    end  
+end,
+
+})
+DiscordSec:Button({
+ Title =
+ "Show Discord Invite",
+Callback = function()  
+    notify(  
+        "N-Hook v5 Discord",  
+        DISCORD_INVITE,  
+        6  
+    )  
+end,
+
+})
+DiscordSec:Paragraph({
+ Title =
+ "Have a Suggestion or Found a Bug?",
+Desc =  
+    "Send it in the Discord server. For bugs, include the feature you were using, what happened, and any error message you received. Suggestions for new features or improvements are welcome too.",
+
+})
+--============================================================
+ -- UNLOAD
+ --============================================================
+ MiscTab:Button({
+ Title =
+ "Unload N-Hook v5",
+Callback = function()  
+    S.alive =  
+        false  
+
+    S.winFarm =  
+        false  
+
+    S.speedSpam =  
+        false  
+    S.speedBurstCancel = true
+    S.speedBurstRunning = false
+    S.semiAutoRunId += 1
+
+    S.auraEquipAll =  
+        false  
+
+    S.auraBuy =  
+        false  
+
+    S.auraCycle =  
+        false  
+
+    S.trailEquipAll =  
+        false  
+
+    S.trailBuy =  
+        false  
+
+    S.trailCycle =  
+        false  
+
+    S.autoLevel =  
+        false  
+
+    S.autoRebirth =  
+        false  
+
+    S.autoUpgrade =  
+        false  
+
+    S.autoClaim =  
+        false  
+
+    S.autoAd =  
+        false  
+
+    S.autoNotif =  
+        false  
+
+    S.autoTutorial =  
+        false  
+
+    S.removeGameplayPaused = false
+    S.hideSpeedPopups = false
+    S.removeKillParts = false
+    S.mobileOptimize = false
+    S.upgradeFarm = false
+    S.emoteCycle = false  
+
+    pcall(function()  
+        setCharacterAnonymous(  
+            false  
+        )  
+    end)  
+
+    disconnectPrivacy()
+    disconnectAntiStreaming()
+    disconnectGameplayPaused()
+    disconnectSpeedPopupWatcher()
+    disconnectPerformanceConnections()
+    disconnectKillPartWatcher()
+    disconnectUpgradeWatcher()
+    pcall(function() setupKillPartRemover(false) end)
+    pcall(function() applyMobileOptimization(false) end)
+    pcall(function() setupAntiAfk(false) end)
+    if S.fpsUnlock then pcall(function() setFPSUnlock(false) end) end
+    stopFly()  
+    pcall(function() setMobileFlyControls(false) end)
+
+    disconnectAll()  
+
+    pcall(function()  
+        restoreLighting()  
+    end)  
+
+    pcall(function()  
+        if WindUI  
+            and WindUI.Unload then  
+
+            WindUI:Unload()  
+        end  
+    end)  
+
+    print(  
+        "[N-Hook v5] Unloaded."  
+    )  
+end,
+
+})
+--============================================================
+ -- INITIAL PRIVACY SETUP
+ --============================================================
+pcall(setupPrivacyWatcher)
+pcall(setupAntiStreaming)
+pcall(setupGameplayPausedWatcher)
+pcall(function() setupKillPartRemover(false) end)
+task.spawn(function()
+ task.wait(1)
+if not S.alive then  
+    return  
+end  
+
+pcall(function()  
+    if Window.User  
+        and Window.User.SetAnonymous then  
+
+        Window.User:SetAnonymous(  
+            S.anonymous  
+        )  
+    end  
+end)  
+
+updatePlayerInfo()
+
+end)
+--============================================================
+ -- LOADED
+ --============================================================
+ notify(
+ "N-Hook v5",
+ (
+ "Loaded • %d pads • %d upgrades • %d auras • %d trails • %d emotes"
+ ):format(
+ #WinPads,
+ #UpgradeButtons,
+ #AuraNames,
+ #TrailNames,
+ #EmoteNames
+ ),
+ 4
+ )
+print(
+ "[N-Hook v5] Loaded successfully"
+ )
+print(
+ "[N-Hook v5] Win pad folder: Workspace.GiveWins"
+ )
+print(
+ "[N-Hook v5] Pads:",
+ #WinPads
+ )
+print(
+ "[N-Hook v5] Auras:",
+ #AuraNames
+ )
+print(
+ "[N-Hook v5] Trails:",
+ #TrailNames
+ )
+print(
+ "[N-Hook v5] LocalPlayer:",
+ LP.Name,
+ "| DisplayName:",
+ LP.DisplayName
+ )
+print(
+ "[N-Hook v5] Discord:",
+ DISCORD_INVITE
+ )
+end -- register-scope
+end
+
+local __NHOOK_XPCALL_OK, __NHOOK_XPCALL_ERR = xpcall(__NHookMain, function(err)
+    local ok, traceback = pcall(function()
+        if debug and type(debug.traceback) == "function" then
+            return debug.traceback(tostring(err), 2)
+        end
+        return tostring(err)
+    end)
+    return ok and traceback or tostring(err)
+end)
+
+if not __NHOOK_XPCALL_OK then
+    warn("[N-Hook v5] SCRIPT RUNTIME ERROR")
+    warn(tostring(__NHOOK_XPCALL_ERR))
+else
+    print("[N-Hook v5] Script finished initialization")
+end
