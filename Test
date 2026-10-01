@@ -1,54 +1,148 @@
-print("[MARK] file loaded, line 1")
 --============================================================
  -- N-HOOK v5
  -- WindUI | Dynamic / Hardened Build
  --============================================================
+local function __NHookMain()
 --============================================================
  -- WINDUI LOADER
  --============================================================
  local WindUI
+local __NHOOK_BOOT_OK = false
+local __NHOOK_BOOT_ERRORS = {}
+
+local function __nHookWarn(stage, err)
+    local msg = string.format("[N-Hook v5] %s: %s", tostring(stage), tostring(err))
+    table.insert(__NHOOK_BOOT_ERRORS, msg)
+    warn(msg)
+end
+
+print("[N-Hook v5] Boot starting...")
+
+-- Delta/mobile-friendly WindUI bootstrap.
+-- Prefer executor request() so GitHub redirects are handled by the executor's
+-- HTTP layer, then fall back to game:HttpGet when request is unavailable.
+local function __nHookFetch(url)
+    local errors = {}
+
+    local requestFns = {}
+    if type(request) == "function" then
+        requestFns[#requestFns + 1] = request
+    end
+    if type(http_request) == "function" then
+        requestFns[#requestFns + 1] = http_request
+    end
+    if syn and type(syn.request) == "function" then
+        requestFns[#requestFns + 1] = syn.request
+    end
+
+    for _, requestFn in ipairs(requestFns) do
+        local ok, response = pcall(function()
+            return requestFn({
+                Url = url,
+                Method = "GET",
+            })
+        end)
+
+        if ok and type(response) == "table" then
+            local body = response.Body or response.body
+            local status = tonumber(response.StatusCode or response.Status or response.status)
+
+            if type(body) == "string" and #body >= 100 then
+                if status == nil or (status >= 200 and status < 400) then
+                    return body
+                end
+                errors[#errors + 1] = "HTTP " .. tostring(status)
+            else
+                errors[#errors + 1] = "request returned no usable Body"
+            end
+        elseif not ok then
+            errors[#errors + 1] = tostring(response)
+        end
+    end
+
+    if type(game.HttpGet) == "function" then
+        local ok, body = pcall(function()
+            return game:HttpGet(url)
+        end)
+        if ok and type(body) == "string" and #body >= 100 then
+            return body
+        end
+        if not ok then
+            errors[#errors + 1] = "game:HttpGet: " .. tostring(body)
+        elseif type(body) ~= "string" then
+            errors[#errors + 1] = "game:HttpGet returned " .. typeof(body)
+        else
+            errors[#errors + 1] = "game:HttpGet returned a short response"
+        end
+    else
+        errors[#errors + 1] = "game:HttpGet unavailable"
+    end
+
+    return nil, table.concat(errors, " | ")
+end
+
 do
- local ok, result = pcall(function()
- local source = game:HttpGet(
- "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
- )
-if type(source) ~= "string" or #source < 100 then  
-        error("WindUI source is empty or invalid")  
-    end  
+    local sources = {
+        -- Current latest WindUI release (1.6.66 as of this build).
+        "https://github.com/Footagesus/WindUI/releases/download/1.6.66/main.lua",
+        -- Raw dist fallback; this path exists in the current WindUI repository.
+        "https://raw.githubusercontent.com/Footagesus/WindUI/refs/heads/main/dist/main.lua",
+        -- Last-resort latest release URL for executors that handle this redirect.
+        "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
+    }
 
-    local loader, compileError = loadstring(source)  
+    local compile = loadstring
+    if type(compile) ~= "function" then
+        __nHookWarn("BOOT FAILED - loadstring is unavailable", "executor does not expose loadstring")
+    else
+        for _, url in ipairs(sources) do
+            print("[N-Hook v5] Trying WindUI: " .. url)
 
-    if type(loader) ~= "function" then  
-        error(  
-            "WindUI loadstring failed: "  
-                .. tostring(compileError)  
-        )  
-    end  
+            local source, fetchError = __nHookFetch(url)
+            if type(source) ~= "string" then
+                __nHookWarn("WindUI download failed", fetchError or "no response body")
+            else
+                -- Reject obvious HTML/redirect pages before compilation.
+                local looksLikeLua = source:find("function", 1, true)
+                    or source:find("CreateWindow", 1, true)
+                    or source:find("local WindUI", 1, true)
 
-    local library = loader()  
+                if #source < 100 or not looksLikeLua then
+                    __nHookWarn("WindUI candidate rejected", "response was not recognized as Lua (" .. tostring(#source) .. " bytes)")
+                else
+                    local okCompile, loader, compileError = pcall(compile, source)
+                    if okCompile and type(loader) == "function" then
+                        local okLibrary, library = pcall(loader)
+                        if okLibrary and library ~= nil then
+                            local okCreate, createWindow = pcall(function()
+                                return library.CreateWindow
+                            end)
 
-    if library == nil then  
-        error("WindUI loader returned nil")  
-    end  
+                            if okCreate and type(createWindow) == "function" then
+                                WindUI = library
+                                __NHOOK_BOOT_OK = true
+                                print("[N-Hook v5] WindUI loaded successfully")
+                                break
+                            end
 
-    return library  
-end)  
+                            __nHookWarn("WindUI candidate rejected", "CreateWindow is missing")
+                        else
+                            __nHookWarn("WindUI candidate failed to initialize", library)
+                        end
+                    else
+                        __nHookWarn("WindUI candidate failed to compile", compileError)
+                    end
+                end
+            end
+        end
+    end
 
-if not ok or not result then  
-    warn("[N-Hook v5] WindUI failed to load:")  
-    warn(tostring(result))  
-    return  
-end  
-
-WindUI = result
-
+    if not __NHOOK_BOOT_OK or WindUI == nil then
+        __nHookWarn("BOOT FAILED - WindUI", "all loader sources failed")
+        return
+    end
 end
-if type(WindUI) ~= "table"
- and type(WindUI) ~= "userdata" then
-warn("[N-Hook v5] Invalid WindUI object")  
-return
 
-end
 --============================================================
  -- SERVICES
  --============================================================
@@ -93,6 +187,8 @@ streamingAssist = true,
 antiStreaming = true,
 antiStreamingRadius = 4096,
 speedBurst = 500,
+speedBurstCancel = false,
+speedBurstRunning = false,
 mobileFlyControls = true,
 hideGroupPopups = true,
 hideP2WButtons = true,
@@ -344,7 +440,7 @@ local function refreshEventsFolder()
  Events = RS:FindFirstChild("Events")
  return Events
  end
-refreshEventsFolder()
+pcall(refreshEventsFolder)
 local RemoteNames = {
  "CarAction",
  "TrailAction",
@@ -534,6 +630,14 @@ local KnownWinAmounts = {
 
 local WinPads = {}
 
+-- Runtime farm stats. This table must exist before scanWinPads() runs.
+-- The original build referenced farm.totalPads / farm.touches before
+-- declaring the table, which caused an immediate nil-index crash.
+local farm = {
+    totalPads = 0,
+    touches = 0,
+}
+
 -- Optional per-place CFrame cache. Everything is guarded so missing executor
 -- file APIs never prevent the main script from loading.
 local WinPadCache = {}
@@ -587,7 +691,7 @@ local function combinedPads()
     table.sort(result,function(a,b) if a.amount==b.amount then return a.index<b.index end return a.amount<b.amount end)
     return result
 end
-loadWinPadCache()
+pcall(loadWinPadCache)
 
 local function getGiveWinsFolder()
     return WS:FindFirstChild("GiveWins")
@@ -790,8 +894,8 @@ local function scanWinPads()
     return #WinPads
 end
 
-scanWinPads()
-saveWinPadCache()
+pcall(scanWinPads)
+pcall(saveWinPadCache)
 
 --============================================================
  -- PAD DROPDOWN MAPPING
@@ -942,7 +1046,7 @@ local function setupPadWatcher()
     end)
 end
 
-setupPadWatcher()
+pcall(setupPadWatcher)
 --============================================================
  -- AURA / TRAIL DISCOVERY
  --============================================================
@@ -1353,7 +1457,7 @@ local function findUpgrade(value)
     return normalized and UpgradeOptionToButton[normalized] or nil
 end
 
-scanUpgradeButtons()
+pcall(scanUpgradeButtons)
 
 local UpgradeWatcherConnections = {}
 local function disconnectUpgradeWatcher()
@@ -1403,7 +1507,7 @@ local function setupUpgradeWatcher()
     end)
 end
 
-setupUpgradeWatcher()
+pcall(setupUpgradeWatcher)
 
 task.spawn(function()
     while S.alive do
@@ -3028,7 +3132,7 @@ local function setupUIFilters()
     end
 end
 
-setupUIFilters()
+pcall(setupUIFilters)
 
 --============================================================
  -- KILL PART REMOVER
@@ -3183,7 +3287,7 @@ local function playSelectedEmote(name)
     return true
 end
 
-refreshEmotes()
+pcall(refreshEmotes)
 
 task.spawn(function()
     while S.alive do
@@ -3199,13 +3303,26 @@ end)
 --============================================================
  -- WINDUI WINDOW
  --============================================================
- local Window = WindUI:CreateWindow({
-    Title = "N-Hook v5",
-    Author = "N-Hook",
-    Folder = "NHookV5",
-    Icon = "solar:wind-bold",
-    ToggleKey = Enum.KeyCode.K,
- })
+local Window
+do
+    local ok, result = pcall(function()
+        return WindUI:CreateWindow({
+            Title = "N-Hook v5",
+            Author = "N-Hook",
+            Folder = "NHookV5",
+            Icon = "solar:wind-bold",
+            ToggleKey = Enum.KeyCode.K,
+        })
+    end)
+
+    if not ok or not result then
+        warn("[N-Hook v5] WindUI CreateWindow failed:")
+        warn(tostring(result))
+        return
+    end
+
+    Window = result
+end
 
 --============================================================
  -- TAB: WIN FARM
@@ -5102,20 +5219,20 @@ end)
 --============================================================
  -- LIVE STATS
  --============================================================
- local MiscStats =
+ S._MiscStats =
  MiscTab:Section({
  Title = "Stats",
  })
-local miscLabel =
- MiscStats:Paragraph({
+S._miscLabel =
+ S._MiscStats:Paragraph({
  Title = "Live",
  Desc = "...",
  })
 task.spawn(function()
  while S.alive do
- if miscLabel then
+ if S._miscLabel then
  pcall(function()
- miscLabel:SetDesc(
+ S._miscLabel:SetDesc(
  (
  "Lv %s | Wins %s | Speed %s | Rebirths %s"
  ):format(
@@ -5153,17 +5270,17 @@ end)
 --============================================================
  -- AUTO-DETECTED PLAYER DATA
  --============================================================
-local DetectedSec = MiscTab:Section({ Title = "Auto-Detected Player Data" })
-local detectedLabel = DetectedSec:Paragraph({ Title = "Folders", Desc = "Scanning..." })
-local wingLabel = DetectedSec:Paragraph({ Title = "Equipped Wings", Desc = "Scanning..." })
+S._DetectedSec = MiscTab:Section({ Title = "Auto-Detected Player Data" })
+S._detectedLabel = S._DetectedSec:Paragraph({ Title = "Folders", Desc = "Scanning..." })
+S._wingLabel = S._DetectedSec:Paragraph({ Title = "Equipped Wings", Desc = "Scanning..." })
 
-local function getFolderCount(name)
+S._getFolderCount = function(name)
     local folder = LP:FindFirstChild(name)
     if not folder then return 0, false end
     return #folder:GetChildren(), true
 end
 
-local function getEquippedWingsObject()
+S._getEquippedWingsObject = function()
     local workspacePlayer = WS:FindFirstChild("LocalPlayer")
     if workspacePlayer then
         local wings = workspacePlayer:FindFirstChild("EquippedWings")
@@ -5182,25 +5299,25 @@ task.spawn(function()
         pcall(function()
             local parts = {}
             for _, name in ipairs({"Cars", "OwnedProducts", "Trails", "Upgrades", "leaderstats"}) do
-                local count, exists = getFolderCount(name)
+                local count, exists = S._getFolderCount(name)
                 if exists then
                     table.insert(parts, ("%s: %d"):format(name, count))
                 end
             end
-            detectedLabel:SetDesc(
+            S._detectedLabel:SetDesc(
                 #parts > 0 and table.concat(parts, " | ")
                     or "No supported player folders detected."
             )
         end)
 
         pcall(function()
-            local wings = getEquippedWingsObject()
+            local wings = S._getEquippedWingsObject()
             if not wings then
-                wingLabel:SetDesc("No EquippedWings object detected.")
+                S._wingLabel:SetDesc("No EquippedWings object detected.")
                 return
             end
 
-            wingLabel:SetDesc(
+            S._wingLabel:SetDesc(
                 ("Object: %s\nIsWingModel: %s\nSourceWing: %s"):format(
                     wings:GetFullName(),
                     tostring(wings:GetAttribute("IsWingModel")),
@@ -5216,12 +5333,12 @@ end)
 --============================================================
  -- DISCORD / COMMUNITY
  --============================================================
- local DiscordSec =
+ S._DiscordSec =
  MiscTab:Section({
  Title =
  "Discord / Feedback",
  })
-DiscordSec:Paragraph({
+S._DiscordSec:Paragraph({
  Title =
  "N-Hook v5 Discord",
 Desc =  
@@ -5229,7 +5346,7 @@ Desc =
         .. "If something breaks, send the error/output and explain what you were doing when it happened.",
 
 })
-DiscordSec:Button({
+S._DiscordSec:Button({
  Title =
  "Copy Discord Invite",
 Callback = function()  
@@ -5255,7 +5372,7 @@ Callback = function()
 end,
 
 })
-DiscordSec:Button({
+S._DiscordSec:Button({
  Title =
  "Copy Invite + Feedback Message",
 Callback = function()  
@@ -5289,7 +5406,7 @@ Callback = function()
 end,
 
 })
-DiscordSec:Button({
+S._DiscordSec:Button({
  Title =
  "Show Discord Invite",
 Callback = function()  
@@ -5301,7 +5418,7 @@ Callback = function()
 end,
 
 })
-DiscordSec:Paragraph({
+S._DiscordSec:Paragraph({
  Title =
  "Have a Suggestion or Found a Bug?",
 Desc =  
@@ -5416,11 +5533,10 @@ end,
 --============================================================
  -- INITIAL PRIVACY SETUP
  --============================================================
- setupPrivacyWatcher()
- setupAntiStreaming()
- setupGameplayPausedWatcher()
- setupSpeedPopupWatcher()
- setupKillPartRemover(false)
+pcall(setupPrivacyWatcher)
+pcall(setupAntiStreaming)
+pcall(setupGameplayPausedWatcher)
+pcall(function() setupKillPartRemover(false) end)
 task.spawn(function()
  task.wait(1)
 if not S.alive then  
@@ -5484,4 +5600,21 @@ print(
  "[N-Hook v5] Discord:",
  DISCORD_INVITE
  )
-print("[MARK] file reached end")
+end
+
+local __NHOOK_XPCALL_OK, __NHOOK_XPCALL_ERR = xpcall(__NHookMain, function(err)
+    local ok, traceback = pcall(function()
+        if debug and type(debug.traceback) == "function" then
+            return debug.traceback(tostring(err), 2)
+        end
+        return tostring(err)
+    end)
+    return ok and traceback or tostring(err)
+end)
+
+if not __NHOOK_XPCALL_OK then
+    warn("[N-Hook v5] SCRIPT RUNTIME ERROR")
+    warn(tostring(__NHOOK_XPCALL_ERR))
+else
+    print("[N-Hook v5] Script finished initialization")
+end
