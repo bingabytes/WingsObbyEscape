@@ -3325,6 +3325,8 @@ do
 end
 
 --============================================================
+-- REGISTER-PRESSURE FIX: each UI tab is separately scoped so Luau can reuse local registers.
+do
  -- TAB: WIN FARM
  --============================================================
  local WinTab =
@@ -3790,6 +3792,8 @@ end,
 
 })
 --============================================================
+end -- register-scope
+do
  -- TAB: AUTO FARM
  --============================================================
  local AutoTab =
@@ -3930,6 +3934,8 @@ end,
 
 })
 --============================================================
+end -- register-scope
+do
  -- TAB: MOVEMENT
  --============================================================
  local MoveTab =
@@ -4137,6 +4143,8 @@ end,
 
 })
 --============================================================
+end -- register-scope
+do
  -- TAB: SPEED
  --============================================================
  local SpeedTab =
@@ -4326,6 +4334,8 @@ end
 
 end)
 --============================================================
+end -- register-scope
+do
  -- TAB: AURAS
  --============================================================
  local AuraTab =
@@ -4540,6 +4550,8 @@ end,
 
 })
 --============================================================
+end -- register-scope
+do
  -- TAB: TRAILS
  --============================================================
  local TrailTab =
@@ -4754,6 +4766,8 @@ end,
 
 })
 --============================================================
+end -- register-scope
+do
  -- TAB: EMOTES
  --============================================================
 local EmoteTab = Window:Tab({ Title = "Emotes", Icon = "smile" })
@@ -4820,6 +4834,8 @@ EmoteSec:Paragraph({
 })
 
 --============================================================
+end -- register-scope
+do
  -- TAB: SETTINGS
  --============================================================
  local MiscTab =
@@ -5219,20 +5235,20 @@ end)
 --============================================================
  -- LIVE STATS
  --============================================================
- S._MiscStats =
+ local MiscStats =
  MiscTab:Section({
  Title = "Stats",
  })
-S._miscLabel =
- S._MiscStats:Paragraph({
+local miscLabel =
+ MiscStats:Paragraph({
  Title = "Live",
  Desc = "...",
  })
 task.spawn(function()
  while S.alive do
- if S._miscLabel then
+ if miscLabel then
  pcall(function()
- S._miscLabel:SetDesc(
+ miscLabel:SetDesc(
  (
  "Lv %s | Wins %s | Speed %s | Rebirths %s"
  ):format(
@@ -5270,17 +5286,17 @@ end)
 --============================================================
  -- AUTO-DETECTED PLAYER DATA
  --============================================================
-S._DetectedSec = MiscTab:Section({ Title = "Auto-Detected Player Data" })
-S._detectedLabel = S._DetectedSec:Paragraph({ Title = "Folders", Desc = "Scanning..." })
-S._wingLabel = S._DetectedSec:Paragraph({ Title = "Equipped Wings", Desc = "Scanning..." })
+local DetectedSec = MiscTab:Section({ Title = "Auto-Detected Player Data" })
+local detectedLabel = DetectedSec:Paragraph({ Title = "Folders", Desc = "Scanning..." })
+local wingLabel = DetectedSec:Paragraph({ Title = "Equipped Wings", Desc = "Scanning..." })
 
-S._getFolderCount = function(name)
+local function getFolderCount(name)
     local folder = LP:FindFirstChild(name)
     if not folder then return 0, false end
     return #folder:GetChildren(), true
 end
 
-S._getEquippedWingsObject = function()
+local function getEquippedWingsObject()
     local workspacePlayer = WS:FindFirstChild("LocalPlayer")
     if workspacePlayer then
         local wings = workspacePlayer:FindFirstChild("EquippedWings")
@@ -5299,25 +5315,25 @@ task.spawn(function()
         pcall(function()
             local parts = {}
             for _, name in ipairs({"Cars", "OwnedProducts", "Trails", "Upgrades", "leaderstats"}) do
-                local count, exists = S._getFolderCount(name)
+                local count, exists = getFolderCount(name)
                 if exists then
                     table.insert(parts, ("%s: %d"):format(name, count))
                 end
             end
-            S._detectedLabel:SetDesc(
+            detectedLabel:SetDesc(
                 #parts > 0 and table.concat(parts, " | ")
                     or "No supported player folders detected."
             )
         end)
 
         pcall(function()
-            local wings = S._getEquippedWingsObject()
+            local wings = getEquippedWingsObject()
             if not wings then
-                S._wingLabel:SetDesc("No EquippedWings object detected.")
+                wingLabel:SetDesc("No EquippedWings object detected.")
                 return
             end
 
-            S._wingLabel:SetDesc(
+            wingLabel:SetDesc(
                 ("Object: %s\nIsWingModel: %s\nSourceWing: %s"):format(
                     wings:GetFullName(),
                     tostring(wings:GetAttribute("IsWingModel")),
@@ -5333,12 +5349,12 @@ end)
 --============================================================
  -- DISCORD / COMMUNITY
  --============================================================
- S._DiscordSec =
+ local DiscordSec =
  MiscTab:Section({
  Title =
  "Discord / Feedback",
  })
-S._DiscordSec:Paragraph({
+DiscordSec:Paragraph({
  Title =
  "N-Hook v5 Discord",
 Desc =  
@@ -5346,7 +5362,7 @@ Desc =
         .. "If something breaks, send the error/output and explain what you were doing when it happened.",
 
 })
-S._DiscordSec:Button({
+DiscordSec:Button({
  Title =
  "Copy Discord Invite",
 Callback = function()  
@@ -5372,7 +5388,7 @@ Callback = function()
 end,
 
 })
-S._DiscordSec:Button({
+DiscordSec:Button({
  Title =
  "Copy Invite + Feedback Message",
 Callback = function()  
@@ -5406,7 +5422,7 @@ Callback = function()
 end,
 
 })
-S._DiscordSec:Button({
+DiscordSec:Button({
  Title =
  "Show Discord Invite",
 Callback = function()  
@@ -5418,7 +5434,7 @@ Callback = function()
 end,
 
 })
-S._DiscordSec:Paragraph({
+DiscordSec:Paragraph({
  Title =
  "Have a Suggestion or Found a Bug?",
 Desc =  
@@ -5600,6 +5616,7 @@ print(
  "[N-Hook v5] Discord:",
  DISCORD_INVITE
  )
+end -- register-scope
 end
 
 local __NHOOK_XPCALL_OK, __NHOOK_XPCALL_ERR = xpcall(__NHookMain, function(err)
